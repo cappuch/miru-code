@@ -12,6 +12,11 @@ out
 dist
 *.tgz
 miru-code.tgz
+/miru
+*.exe
+
+# Go
+vendor/
 
 # code coverage
 coverage
@@ -40,8 +45,12 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
-# brand art sources (regenerate via scripts/render-crane-art.ts)
-assets/
+# brand art sources (keep tokenizer + agent templates)
+assets/brand/
+!assets/tokenizer/
+!assets/agents/
 
 # MCP conformance tests download the official schema locally (see scripts/vendor-mcp-schema.ts)
 tests/fixtures/mcp/*.json
+
+ts_miru_code/

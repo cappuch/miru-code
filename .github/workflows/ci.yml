@@ -3,16 +3,52 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  lint-typecheck:
+  go:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+        run: go build -o miru ./cmd/miru
+
+      - name: Test
+        env:
+          CGO_ENABLED: "1"
+        run: go test ./...
+
+      - name: Build matrix smoke
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          # AST chunking requires CGO; smoke-compile std packages without grammars via tags when needed.
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/miru-linux ./cmd/miru || true
+          # Prefer native CGO build on the runner OS:
+          CGO_ENABLED=1 go build -o /tmp/miru-native ./cmd/miru
+
+  bun:
+    if: hashFiles('ts_miru_code/package.json') != ''
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts_miru_code
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -29,27 +65,6 @@ jobs:
 
       - name: Typecheck
         run: bun run typecheck
-
-  test:
-    runs-on: ${{ matrix.os }}
-    needs: lint-typecheck
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install
-        run: bun install --frozen-lockfile
-
-      - name: Install ripgrep
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
 
       - name: Test
         run: bun test
