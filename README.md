@@ -1,7 +1,6 @@
 # Miru Code
 
-Hybrid semantic + keyword code search for coding agents. This repository is the **Go** implementation (`github.com/takara-ai/miru-code`). The TypeScript reference lives under `ts_miru_code/`.
-
+Hybrid semantic + keyword code search for coding agents. This repository is the **Go** implementation (`github.com/takara-ai/miru-code`). 
 ## Install / build
 
 ```bash
