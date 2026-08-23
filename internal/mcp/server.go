@@ -3,8 +3,6 @@ package mcp
 import (
 	"fmt"
 
-	"github.com/takara-ai/miru-code/internal/auth"
-	"github.com/takara-ai/miru-code/internal/credentials"
 	"github.com/takara-ai/miru-code/internal/installer"
 	"github.com/takara-ai/miru-code/internal/literal"
 	"github.com/takara-ai/miru-code/internal/miruindex"
@@ -17,19 +15,6 @@ const repoDescription =
 		"Pass the project root for local workspaces. " +
 		"The index is built on the first tool call and cached for the session."
 
-const authToolDescription =
-	"Sign in with Takara credentials via device-code login — no terminal required. " +
-		"Only call this in direct response to a tool error mentioning missing/expired " +
-		"credentials — never speculatively, since it starts a real sign-in prompt for the " +
-		"user. Call with no arguments (or action \"start\") to begin: it returns a URL and a " +
-		"short code. Show both to the user and ask them to open the link and approve. Once " +
-		"they confirm, call again with action \"check\" to complete sign-in."
-
-type pendingDeviceAuth struct {
-	start  auth.DeviceAuthorizationStart
-	config auth.DeviceAuthConfig
-}
-
 // CreateMcpServer registers search/locate/expand/find_related/auth tools.
 func CreateMcpServer(cache *IndexCache, benchmark bool) *MiruMcpServer {
 	_ = benchmark // full benchmark mode omitted in Go port
@@ -38,92 +23,6 @@ func CreateMcpServer(cache *IndexCache, benchmark bool) *MiruMcpServer {
 	registerAuthTool(server)
 	registerSearchTools(server, cache)
 	return server
-}
-
-func registerAuthTool(server *MiruMcpServer) {
-	var pending *pendingDeviceAuth
-	server.RegisterTool("auth", ToolSchema{
-		Description: authToolDescription,
-		InputSchema: ObjectSchema(map[string]any{
-			"action": map[string]any{
-				"type":        "string",
-				"enum":        []string{"start", "check"},
-				"description": `"start" begins a device-code login (default); "check" completes it.`,
-			},
-		}, nil),
-		Handler: func(args map[string]any) (ToolResult, error) {
-			action := StringArg(args, "action")
-			if action == "check" {
-				return authCheck(&pending)
-			}
-			return authStart(&pending)
-		},
-	})
-}
-
-func authStart(pending **pendingDeviceAuth) (ToolResult, error) {
-	if *pending != nil {
-		start := (*pending).start
-		link := start.VerificationURI
-		if start.VerificationURIComplete != "" {
-			link = start.VerificationURIComplete
-		}
-		return ToolText(fmt.Sprintf(
-			"A device login is already pending. Open %s and enter code %s if not already filled in, then call `auth` again with action \"check\" once approved.",
-			link, start.UserCode,
-		)), nil
-	}
-	config := auth.ResolveDeviceAuthConfig()
-	start, err := auth.StartDeviceAuthorization(&config, nil)
-	if err != nil {
-		return ToolText(err.Error()), nil
-	}
-	*pending = &pendingDeviceAuth{start: start, config: config}
-	link := start.VerificationURI
-	msg := fmt.Sprintf("Open %s and approve the request", link)
-	if start.VerificationURIComplete != "" {
-		link = start.VerificationURIComplete
-		msg = fmt.Sprintf("Open %s and approve the request.", link)
-	} else {
-		msg += fmt.Sprintf(" (enter code %s if prompted).", start.UserCode)
-	}
-	msg += fmt.Sprintf(" Code: %s. Once the user confirms they've approved it, call `auth` again with action \"check\" to finish signing in.", start.UserCode)
-	return ToolText(msg), nil
-}
-
-func authCheck(pending **pendingDeviceAuth) (ToolResult, error) {
-	if *pending == nil {
-		return ToolText("No device login is pending. Call `auth` with action \"start\" first."), nil
-	}
-	result, err := auth.CheckDeviceAuthorizationOnce((*pending).start, &(*pending).config, nil)
-	if err != nil {
-		return ToolText(err.Error()), nil
-	}
-	switch result.Status {
-	case "success":
-		*pending = nil
-		_, _ = credentials.SaveDeviceCode(auth.SaveDeviceCodeInput{
-			AccessToken:  result.Tokens.AccessToken,
-			RefreshToken: result.Tokens.RefreshToken,
-			ExpiresAt:    result.Tokens.ExpiresAt,
-			TokenType:    result.Tokens.TokenType,
-			Scope:        result.Tokens.Scope,
-		})
-		credentials.SetStoredCredentialsEnvToken(result.Tokens.AccessToken)
-		return ToolText("Signed in successfully. Miru tools are now ready to use."), nil
-	case "pending":
-		return ToolText("Still waiting for approval. Ask the user to confirm they clicked and approved, then call `auth` again with action \"check\"."), nil
-	case "slow_down":
-		return ToolText("Checking too soon — wait a bit before calling `auth` again with action \"check\"."), nil
-	case "denied":
-		*pending = nil
-		return ToolText("Sign-in was denied. Call `auth` with action \"start\" to try again."), nil
-	case "expired":
-		*pending = nil
-		return ToolText("The device code expired before it was approved. Call `auth` with action \"start\" to try again."), nil
-	default:
-		return ToolText("Unexpected auth status."), nil
-	}
 }
 
 func registerSearchTools(server *MiruMcpServer, cache *IndexCache) {
@@ -148,12 +47,12 @@ func registerSearchTools(server *MiruMcpServer, cache *IndexCache) {
 			repo := StringArg(args, "repo")
 			idx, err := GetIndexForRepo(repo, cache, nil)
 			if err != nil {
-				return ToolText(err.Error()), nil
+				return toolErrorText(err), nil
 			}
 			k := utils.ClampMCPTopK(IntArg(args, "top_k"))
 			results, err := idx.Search(miruindex.SearchOptions{Query: query, TopK: k})
 			if err != nil {
-				return ToolText(err.Error()), nil
+				return toolErrorText(err), nil
 			}
 			dedupe := BoolArg(args, "dedupe_by_file")
 			if dedupe == nil || *dedupe {
@@ -196,7 +95,7 @@ func registerSearchTools(server *MiruMcpServer, cache *IndexCache) {
 			repo := StringArg(args, "repo")
 			idx, err := GetIndexForRepo(repo, cache, nil)
 			if err != nil {
-				return ToolText(err.Error()), nil
+				return toolErrorText(err), nil
 			}
 			var lit any
 			if raw, ok := args["literal"].([]any); ok {
@@ -245,7 +144,7 @@ func registerSearchTools(server *MiruMcpServer, cache *IndexCache) {
 			repo := StringArg(args, "repo")
 			idx, err := GetIndexForRepo(repo, cache, nil)
 			if err != nil {
-				return ToolText(err.Error()), nil
+				return toolErrorText(err), nil
 			}
 			before := utils.DefaultExpandBefore
 			after := utils.DefaultExpandAfter
@@ -291,7 +190,7 @@ func registerSearchTools(server *MiruMcpServer, cache *IndexCache) {
 			repo := StringArg(args, "repo")
 			idx, err := GetIndexForRepo(repo, cache, nil)
 			if err != nil {
-				return ToolText(err.Error()), nil
+				return toolErrorText(err), nil
 			}
 			repoRoot := utils.LocalRepoRoot(repo)
 			chunk := utils.ResolveChunk(idx.Chunks(), filePath, *anchorLinePtr, repoRoot)
@@ -301,7 +200,7 @@ func registerSearchTools(server *MiruMcpServer, cache *IndexCache) {
 			k := utils.ClampMCPTopK(IntArg(args, "top_k"))
 			results, err := idx.FindRelated(*chunk, k)
 			if err != nil {
-				return ToolText(err.Error()), nil
+				return toolErrorText(err), nil
 			}
 			if len(results) == 0 {
 				return ToolText(fmt.Sprintf("No related chunks found for %s:%d.", filePath, *anchorLinePtr)), nil

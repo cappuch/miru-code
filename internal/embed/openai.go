@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/takara-ai/miru-code/internal/autherr"
 	"github.com/takara-ai/miru-code/internal/concurrency"
 	"github.com/takara-ai/miru-code/internal/env"
 )
@@ -377,6 +378,7 @@ const embeddingAuthErrorMessage = "Not authorized. Check your API key and/or tok
 type APIError struct {
 	Status int
 	Body   string
+	cause  error
 }
 
 func (e *APIError) Error() string {
@@ -388,6 +390,20 @@ func (e *APIError) Error() string {
 		body = body[:500]
 	}
 	return fmt.Sprintf("Embedding API error %d: %s", e.Status, body)
+}
+
+func (e *APIError) Unwrap() error {
+	return e.cause
+}
+
+func newAPIError(status int, body string) *APIError {
+	err := &APIError{Status: status, Body: body}
+	if status == 401 || status == 403 {
+		// Preserve HTTP details while marking it recoverable so MCP tools can offer
+		// the device-code flow instead of leaving agents to fall back to shell commands.
+		err.cause = autherr.New(embeddingAuthErrorMessage, nil)
+	}
+	return err
 }
 
 func isTransientEmbeddingError(err error) bool {
@@ -450,7 +466,7 @@ func (c *httpEmbeddingClient) CreateEmbeddings(input []string, model string, dim
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &APIError{Status: resp.StatusCode, Body: string(raw)}
+		return nil, newAPIError(resp.StatusCode, string(raw))
 	}
 	var out EmbeddingResponse
 	if err := json.Unmarshal(raw, &out); err != nil {

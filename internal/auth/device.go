@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/takara-ai/miru-code/internal/autherr"
 	"github.com/takara-ai/miru-code/internal/env"
 )
 
@@ -282,7 +283,9 @@ func PollDeviceAuthorization(start DeviceAuthorizationStart, config *DeviceAuthC
 // RefreshDeviceAuthorization refreshes stored device-code credentials.
 func RefreshDeviceAuthorization(credentials StoredCredentials, config *DeviceAuthConfig, client *http.Client) (DeviceAuthorizationTokens, error) {
 	if strings.TrimSpace(credentials.RefreshToken) == "" {
-		return DeviceAuthorizationTokens{}, fmt.Errorf("Stored device credentials cannot be refreshed because no refresh token exists.")
+		return DeviceAuthorizationTokens{}, autherr.New(
+			"Stored device credentials cannot be refreshed because no refresh token exists.", nil,
+		)
 	}
 	cfg := ResolveDeviceAuthConfig()
 	if config != nil {
@@ -302,12 +305,16 @@ func RefreshDeviceAuthorization(credentials StoredCredentials, config *DeviceAut
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var errPayload oauthTokenError
 		_ = json.Unmarshal(text, &errPayload)
-		return DeviceAuthorizationTokens{}, fmt.Errorf("Device token refresh failed: %s", parseTokenError(errPayload))
+		return DeviceAuthorizationTokens{}, autherr.New(
+			fmt.Sprintf("Device token refresh failed: %s", parseTokenError(errPayload)), nil,
+		)
 	}
 	var success oauthTokenSuccess
 	_ = json.Unmarshal(text, &success)
 	if strings.TrimSpace(success.AccessToken) == "" {
-		return DeviceAuthorizationTokens{}, fmt.Errorf("Token refresh succeeded but did not return an access token.")
+		return DeviceAuthorizationTokens{}, autherr.New(
+			"Token refresh succeeded but did not return an access token.", nil,
+		)
 	}
 	if success.RefreshToken == "" {
 		success.RefreshToken = credentials.RefreshToken

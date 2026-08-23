@@ -4,6 +4,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/takara-ai/miru-code/internal/autherr"
 )
 
 // EnvInt reads an int env var with fallback and minimum.
@@ -75,11 +77,16 @@ func HasTakaraAPIKeyInEnv() bool {
 	return IsUsableTakaraAPIKey(os.Getenv(TakaraAPIKeyEnv))
 }
 
-// ResolveEmbeddingAPIKey returns TAKARA_API_KEY or an error.
+// ResolveEmbeddingAPIKey returns TAKARA_API_KEY or a CredentialsError when missing.
 func ResolveEmbeddingAPIKey() (string, error) {
 	key := strings.TrimSpace(os.Getenv(TakaraAPIKeyEnv))
 	if !IsUsableTakaraAPIKey(key) {
-		return "", errMissingAPIKey
+		return "", autherr.New(
+			"Takara credentials required. If you're an agent with Miru MCP tools available, call the "+
+				"`auth` tool to sign in. Otherwise run `miru setup`, or set TAKARA_API_KEY in your MCP "+
+				"server env or .env.local.",
+			nil,
+		)
 	}
 	return key, nil
 }
@@ -89,13 +96,3 @@ func IsSageMakerConfigured() bool {
 	return strings.TrimSpace(os.Getenv("MIRU_SAGEMAKER_ENDPOINT_ARN")) != "" ||
 		strings.TrimSpace(os.Getenv("MIRU_SAGEMAKER_ENDPOINT_NAME")) != ""
 }
-
-type missingAPIKeyError struct{}
-
-func (missingAPIKeyError) Error() string {
-	return "Takara credentials required. If you're an agent with Miru MCP tools available, call the " +
-		"`auth` tool to sign in. Otherwise run `miru setup`, or set TAKARA_API_KEY in your MCP " +
-		"server env or .env.local."
-}
-
-var errMissingAPIKey = missingAPIKeyError{}
