@@ -62,6 +62,8 @@ On-disk layout matches the TS port for interoperability:
 
 Override with `TAKARA_API_KEY` or `MIRU_CREDENTIALS_DIR`.
 
+Enterprise self-hosted embeddings (no Takara egress): see [docs/self-hosted-sagemaker.md](docs/self-hosted-sagemaker.md). CloudFormation/CDK examples live under [examples/sagemaker-marketplace](examples/sagemaker-marketplace).
+
 ## Development
 
 ```bash
@@ -71,3 +73,10 @@ go test ./internal/oracle/...   # parity/oracle suite
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Credits
+
+- **[semble](https://github.com/MinishLab/semble)** (MIT). Miru ports parts of semble. These parts include the file walker, the index layout, the BM25 tokenizer, the hybrid search pipeline, and the ranking signals.
+- **[potion-code](https://huggingface.co/minishlab/potion-code-16M)** and **[Model2Vec](https://github.com/MinishLab/model2vec)** (MIT). The WordPiece tokenizer in `assets/tokenizer/tokenizer.json` comes from potion-code.
+
+See [NOTICE](./NOTICE) for the licence text and the Model2Vec citation.
