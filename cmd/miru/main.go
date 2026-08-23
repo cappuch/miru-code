@@ -107,12 +107,32 @@ func runCLI(argv []string) error {
 		fmt.Println(version.MiruVersion())
 		return nil
 	case "help":
-		if len(rest) == 0 {
+		if len(rest) == 0 || rest[0] == "-h" || rest[0] == "--help" {
 			help.PrintMainHelp()
 			return nil
 		}
 		help.PrintCommandHelp(rest[0])
 		return nil
+	case "env", "environment":
+		help.PrintEnvironmentHelp()
+		return nil
+	}
+
+	if command == "setup" && containsHelpFlag(rest) {
+		if containsFlag(rest, "--sagemaker") {
+			help.PrintSageMakerHelp()
+		} else {
+			help.PrintCommandHelp("setup")
+		}
+		return nil
+	}
+
+	if len(rest) > 0 && (rest[0] == "-h" || rest[0] == "--help") {
+		help.PrintCommandHelp(command)
+		return nil
+	}
+
+	switch command {
 	case "hook-guard":
 		os.Exit(hooks.RunSearchGuardFromStdin(os.Stdin))
 	case "install", "uninstall":
@@ -189,6 +209,19 @@ func runCLI(argv []string) error {
 		os.Exit(1)
 	}
 	return nil
+}
+
+func containsHelpFlag(args []string) bool {
+	return containsFlag(args, "-h") || containsFlag(args, "--help")
+}
+
+func containsFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
 }
 
 func runSetup(rest []string) error {

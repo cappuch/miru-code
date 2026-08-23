@@ -36,12 +36,12 @@ func PrintMainHelp() {
 	cliui.WriteStdout("  miru setup && miru install")
 	cliui.WriteStdout(`  miru search "auth middleware" ./src`)
 	cliui.WriteStdout("")
-	cliui.Hint("miru help <command>  ·  miru -h for environment variables  ·  miru -v for version")
+	cliui.Hint("miru <command> -h  ·  miru -v for version")
 	cliui.WriteStdout("")
 }
 
-// PrintEnvHelp prints environment variable help.
-func PrintEnvHelp() {
+// PrintEnvironmentHelp prints Takara/env variable help (without SageMaker).
+func PrintEnvironmentHelp() {
 	cliui.Section("Environment")
 	cliui.WriteStdout("  " + env.TakaraAPIKeyEnv)
 	cliui.WriteStdout("      Takara bearer token for embeddings")
@@ -54,12 +54,36 @@ func PrintEnvHelp() {
 	cliui.WriteStdout("  MIRU_TOKENIZER_JSON")
 	cliui.WriteStdout("      Path to tokenizer.json")
 	cliui.WriteStdout("")
+}
+
+// PrintSageMakerHelp prints self-hosted SageMaker env and setup hints.
+func PrintSageMakerHelp() {
 	cliui.Section("Self-hosted (AWS SageMaker)")
 	cliui.WriteStdout("  MIRU_SAGEMAKER_ENDPOINT_ARN")
-	cliui.WriteStdout("      arn:aws:sagemaker:<region>:<account-id>:endpoint/<name>")
-	cliui.WriteStdout("  AWS_PROFILE / AWS_ACCESS_KEY_ID / …")
-	cliui.WriteStdout("      Standard AWS credential resolution")
+	cliui.WriteStdout("      arn:aws:sagemaker:<region>:<account-id>:endpoint/<name> — set this to")
+	cliui.WriteStdout("      bypass Takara entirely and embed via your own SageMaker endpoint.")
+	cliui.WriteStdout("  MIRU_SAGEMAKER_ENDPOINT_NAME / MIRU_SAGEMAKER_REGION")
+	cliui.WriteStdout("      Alternative to the ARN when you'd rather name the endpoint + region")
+	cliui.WriteStdout("      directly (falls back to AWS_REGION / AWS_DEFAULT_REGION).")
+	cliui.WriteStdout("  MIRU_SAGEMAKER_NORMALIZE / MIRU_SAGEMAKER_TRUNCATE")
+	cliui.WriteStdout("      Default: true")
+	cliui.WriteStdout("  MIRU_SAGEMAKER_TRUNCATION_DIRECTION")
+	cliui.WriteStdout(`      "Left" | "Right" (default: Right)`)
+	cliui.WriteStdout("  MIRU_SAGEMAKER_PROMPT_NAME")
+	cliui.WriteStdout("      Optional prompt_name passed to the endpoint")
+	cliui.WriteStdout("  AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN / AWS_PROFILE")
+	cliui.WriteStdout("      Standard AWS credential resolution — nothing Miru-specific to set")
 	cliui.WriteStdout("")
+	cliui.Hint("Enterprise self-hosted setup: docs/self-hosted-sagemaker.md")
+	cliui.Hint("Then: miru setup --sagemaker --arn <arn> --profile <name>")
+	cliui.Hint("Setup confirms auth, saves SageMaker config, and removes any stored Takara API key.")
+	cliui.WriteStdout("")
+}
+
+// PrintEnvHelp prints environment + SageMaker help.
+func PrintEnvHelp() {
+	PrintEnvironmentHelp()
+	PrintSageMakerHelp()
 }
 
 // PrintFullHelp prints main + env help.
@@ -71,6 +95,8 @@ func PrintFullHelp() {
 // PrintCommandHelp prints help for one command.
 func PrintCommandHelp(command string) {
 	switch command {
+	case "env", "environment":
+		PrintEnvironmentHelp()
 	case "search":
 		cliui.CommandHeader("search", "Hybrid semantic + keyword search.")
 		cliui.Section("Usage")
@@ -110,6 +136,21 @@ func PrintCommandHelp(command string) {
 		cliui.Section("Usage")
 		cliui.WriteStdout("  miru setup [--device] [--key TOKEN] [--force] [--clear]")
 		cliui.WriteStdout("  miru setup --sagemaker --arn ENDPOINT_ARN --profile NAME")
+		cliui.Section("Options (Takara)")
+		cliui.WriteStdout("  --device            Start device-code login (default when interactive)")
+		cliui.WriteStdout("  --key, -k TOKEN     Non-interactive: store a bearer token directly")
+		cliui.WriteStdout("  --force             Replace existing stored credentials")
+		cliui.WriteStdout("  --clear             Remove stored credentials")
+		cliui.Section("Options (SageMaker)")
+		cliui.WriteStdout("  --sagemaker         Switch setup to self-hosted SageMaker mode")
+		cliui.WriteStdout("  --arn ARN           Endpoint ARN (implies --sagemaker)")
+		cliui.WriteStdout("  --profile NAME      AWS profile to inherit credentials from")
+		cliui.WriteStdout("")
+		cliui.Hint("Enterprise guide: docs/self-hosted-sagemaker.md (Marketplace + invoke-user runbook).")
+		cliui.Hint("Takara and SageMaker are mutually exclusive — setup for one removes the other.")
+		cliui.Hint("SageMaker setup invokes the endpoint once (auth + embedding check), then saves.")
+		cliui.Hint("Then: miru setup --sagemaker --arn <arn> --profile miru")
+		cliui.Hint("miru setup --sagemaker -h for SageMaker environment variables.")
 		cliui.WriteStdout("")
 	case "install":
 		cliui.CommandHeader("install", "Interactive global agent setup.")
