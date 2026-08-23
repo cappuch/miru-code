@@ -102,6 +102,26 @@ const SageMakerAuthErrorMessage = "Not authorized to invoke this SageMaker endpo
 	"(AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN or AWS_PROFILE) and that the " +
 	"identity has sagemaker:InvokeEndpoint permission on the endpoint."
 
+// SageMakerNotFoundErrorMessage is shown when the endpoint name no longer exists.
+const SageMakerNotFoundErrorMessage =
+	"SageMaker endpoint not found — it may have been deleted, renamed, or deployed in a " +
+		"different region. Confirm the endpoint still exists, then run `miru setup --sagemaker` " +
+		"again to re-authenticate and re-point Miru at the correct endpoint."
+
+// SageMakerUnreachableErrorMessage is shown for DNS/connection-level failures.
+const SageMakerUnreachableErrorMessage =
+	"Could not reach the SageMaker endpoint (network error). Check your network/VPN/VPC " +
+		"access and that the configured region is correct, then run `miru setup --sagemaker` " +
+		"again to re-authenticate and re-validate the connection."
+
+var sageMakerNetworkErrorCodes = map[string]struct{}{
+	"ENOTFOUND":    {},
+	"ECONNREFUSED": {},
+	"ECONNRESET":   {},
+	"ETIMEDOUT":    {},
+	"EAI_AGAIN":    {},
+}
+
 // SageMakerInvokeError is an InvokeEndpoint failure.
 type SageMakerInvokeError struct {
 	Status  int
@@ -212,6 +232,30 @@ func toSageMakerInvokeError(err error) error {
 			return &SageMakerInvokeError{Status: 403, Message: SageMakerAuthErrorMessage}
 		}
 	}
+
+	// SageMaker returns a generic ValidationError for both "endpoint doesn't exist" and
+	// malformed-request cases — only the message distinguishes them.
+	if strings.Contains(msg, "ValidationError") && strings.Contains(strings.ToLower(msg), "not found") {
+		return &SageMakerInvokeError{Status: 404, Message: SageMakerNotFoundErrorMessage}
+	}
+	if strings.Contains(strings.ToLower(msg), "endpoint") && strings.Contains(strings.ToLower(msg), "not found") {
+		return &SageMakerInvokeError{Status: 404, Message: SageMakerNotFoundErrorMessage}
+	}
+
+	lower := strings.ToLower(msg)
+	for code := range sageMakerNetworkErrorCodes {
+		if strings.Contains(msg, code) || strings.Contains(lower, strings.ToLower(code)) {
+			return &SageMakerInvokeError{Status: 503, Message: SageMakerUnreachableErrorMessage}
+		}
+	}
+	// Go net errors often surface as "dial tcp … connection refused" / "i/o timeout".
+	if strings.Contains(lower, "connection refused") ||
+		strings.Contains(lower, "i/o timeout") ||
+		strings.Contains(lower, "no such host") ||
+		strings.Contains(lower, "network is unreachable") {
+		return &SageMakerInvokeError{Status: 503, Message: SageMakerUnreachableErrorMessage}
+	}
+
 	if strings.Contains(msg, "424") {
 		return &SageMakerInvokeError{
 			Status:  424,
