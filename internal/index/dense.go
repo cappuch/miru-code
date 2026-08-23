@@ -9,162 +9,131 @@ import (
 	"path/filepath"
 )
 
-type QueryResult struct {
-	Indices   []int
-	Distances []float64
-}
-
+// VectorIndex is uncompressed float32 semantic index.
 type VectorIndex struct {
-	vectors [][]float32
+	data  []float32
+	count int
+	dim   int
 }
 
+// NewVectorIndex builds from float32 vectors.
 func NewVectorIndex(vectors [][]float32) *VectorIndex {
-	return &VectorIndex{vectors: vectors}
-}
-
-func (v *VectorIndex) Size() int {
-	return len(v.vectors)
-}
-
-func (v *VectorIndex) Dimensions() int {
-	if len(v.vectors) == 0 {
-		return 0
+	if len(vectors) == 0 {
+		return &VectorIndex{}
 	}
-	return len(v.vectors[0])
+	dim := len(vectors[0])
+	data := make([]float32, len(vectors)*dim)
+	for i, vec := range vectors {
+		copy(data[i*dim:], vec)
+	}
+	return &VectorIndex{data: data, count: len(vectors), dim: dim}
 }
 
-func (v *VectorIndex) Vectors() [][]float32 {
-	return v.vectors
+// VectorFromFlatBuffer restores from a flat buffer.
+func VectorFromFlatBuffer(data []float32, count, dim int) *VectorIndex {
+	return &VectorIndex{data: data, count: count, dim: dim}
 }
+
+func (v *VectorIndex) Size() int                     { return v.count }
+func (v *VectorIndex) Dimensions() int               { return v.dim }
+func (v *VectorIndex) MemoryBytes() int              { return v.count * v.dim * 4 }
+func (v *VectorIndex) Storage() SemanticStorage      { return StorageFloat32 }
 
 func (v *VectorIndex) VectorAt(docIndex int) ([]float32, error) {
-	if docIndex < 0 || docIndex >= len(v.vectors) {
-		return nil, fmt.Errorf("missing vector at index %d", docIndex)
+	if docIndex < 0 || docIndex >= v.count {
+		return nil, fmt.Errorf("Missing vector at index %d", docIndex)
 	}
-	return v.vectors[docIndex], nil
+	out := make([]float32, v.dim)
+	copy(out, v.data[docIndex*v.dim:(docIndex+1)*v.dim])
+	return out, nil
 }
 
-func (v *VectorIndex) MemoryBytes() int {
-	return len(v.vectors) * v.Dimensions() * 4
+func cosineDistanceFlat(data []float32, dim, docIndex int, query []float32) float64 {
+	offset := docIndex * dim
+	var dot float64
+	for i := 0; i < dim; i++ {
+		dot += float64(query[i]) * float64(data[offset+i])
+	}
+	return 1 - dot
 }
 
-func (v *VectorIndex) Query(queryVector []float32, k int, selector ...[]int) (QueryResult, error) {
+// Query returns top-k by cosine distance.
+func (v *VectorIndex) Query(queryVector []float32, k int, selector []int) (QueryResult, error) {
 	if k < 1 {
 		return QueryResult{}, fmt.Errorf("k should be >= 1, is now %d", k)
 	}
-	if len(v.vectors) == 0 {
+	if v.count == 0 {
 		return QueryResult{}, nil
 	}
-
-	indices := make([]int, len(v.vectors))
-	for i := range indices {
-		indices[i] = i
+	maxN := v.count
+	if selector != nil {
+		maxN = len(selector)
 	}
-	if len(selector) > 0 && selector[0] != nil {
-		indices = selector[0]
+	effectiveK := k
+	if effectiveK > maxN {
+		effectiveK = maxN
 	}
-	effectiveK := min(k, len(indices))
 	if effectiveK == 0 {
 		return QueryResult{}, nil
 	}
-
-	entries := make([]TopKDistanceEntry, 0, len(indices))
-	for _, idx := range indices {
-		if idx < 0 || idx >= len(v.vectors) {
-			continue
+	collector := NewTopKDistanceCollector(effectiveK)
+	if selector != nil {
+		for _, idx := range selector {
+			if idx < 0 || idx >= v.count {
+				continue
+			}
+			collector.Offer(idx, cosineDistanceFlat(v.data, v.dim, idx, queryVector))
 		}
-		entries = append(entries, TopKDistanceEntry{Index: idx, Distance: cosineDistance(queryVector, v.vectors[idx])})
+	} else {
+		for i := 0; i < v.count; i++ {
+			collector.Offer(i, cosineDistanceFlat(v.data, v.dim, i, queryVector))
+		}
 	}
-	top := SelectTopKByDistance(entries, effectiveK)
-	return queryResultFromTop(top), nil
+	top := collector.Finish()
+	res := QueryResult{Indices: make([]int, len(top)), Distances: make([]float64, len(top))}
+	for i, e := range top {
+		res.Indices[i] = e.Index
+		res.Distances[i] = e.Distance
+	}
+	return res, nil
 }
 
+// Save writes vectors.bin + meta.json.
 func (v *VectorIndex) Save(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-
-	dim := v.Dimensions()
-	count := v.Size()
-	buf := make([]byte, count*dim*4)
-	offset := 0
-	for _, vector := range v.vectors {
-		for _, value := range vector {
-			binary.LittleEndian.PutUint32(buf[offset:], math.Float32bits(value))
-			offset += 4
-		}
+	buf := make([]byte, len(v.data)*4)
+	for i, f := range v.data {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
 	}
 	if err := os.WriteFile(filepath.Join(dir, "vectors.bin"), buf, 0o644); err != nil {
 		return err
 	}
-	return writeMeta(dir, semanticMeta{Count: count, Dimensions: dim, Storage: "float32"})
+	meta, _ := json.Marshal(map[string]any{"count": v.count, "dimensions": v.dim, "storage": "float32"})
+	return os.WriteFile(filepath.Join(dir, "meta.json"), meta, 0o644)
 }
 
-func LoadVectorIndex(dir string) (*VectorIndex, error) {
-	meta, err := readMeta(dir)
+// LoadVector loads float32 index from disk.
+func LoadVector(dir string) (*VectorIndex, error) {
+	metaBytes, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
+		return nil, err
+	}
+	var meta struct {
+		Count      int `json:"count"`
+		Dimensions int `json:"dimensions"`
+	}
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
 		return nil, err
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "vectors.bin"))
 	if err != nil {
 		return nil, err
 	}
-	vectors := make([][]float32, meta.Count)
-	for i := 0; i < meta.Count; i++ {
-		vector := make([]float32, meta.Dimensions)
-		for j := 0; j < meta.Dimensions; j++ {
-			offset := (i*meta.Dimensions + j) * 4
-			vector[j] = math.Float32frombits(binary.LittleEndian.Uint32(raw[offset:]))
-		}
-		vectors[i] = vector
+	data := make([]float32, len(raw)/4)
+	for i := range data {
+		data[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
 	}
-	return NewVectorIndex(vectors), nil
-}
-
-func cosineDistance(a, b []float32) float64 {
-	var dot float64
-	for i := range a {
-		var bv float32
-		if i < len(b) {
-			bv = b[i]
-		}
-		dot += float64(a[i]) * float64(bv)
-	}
-	return 1 - dot
-}
-
-func queryResultFromTop(top []TopKDistanceEntry) QueryResult {
-	result := QueryResult{
-		Indices:   make([]int, len(top)),
-		Distances: make([]float64, len(top)),
-	}
-	for i, entry := range top {
-		result.Indices[i] = entry.Index
-		result.Distances[i] = entry.Distance
-	}
-	return result
-}
-
-type semanticMeta struct {
-	Count      int    `json:"count"`
-	Dimensions int    `json:"dimensions"`
-	Storage    string `json:"storage,omitempty"`
-}
-
-func writeMeta(dir string, meta semanticMeta) error {
-	data, err := json.Marshal(meta)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "meta.json"), data, 0o644)
-}
-
-func readMeta(dir string) (semanticMeta, error) {
-	var meta semanticMeta
-	data, err := os.ReadFile(filepath.Join(dir, "meta.json"))
-	if err != nil {
-		return meta, err
-	}
-	err = json.Unmarshal(data, &meta)
-	return meta, err
+	return VectorFromFlatBuffer(data, meta.Count, meta.Dimensions), nil
 }

@@ -1,65 +1,101 @@
 package env
 
 import (
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
 )
 
-const TakaraAPIKeyEnv = "TAKARA_API_KEY"
-
-func Int(name string, fallback int, minValue ...int) int {
-	min := 1
-	if len(minValue) > 0 {
-		min = minValue[0]
-	}
+// EnvInt reads an int env var with fallback and minimum.
+func EnvInt(name string, fallback, min int) int {
 	raw := os.Getenv(name)
 	if raw == "" {
 		return fallback
 	}
-	n, err := strconv.ParseFloat(raw, 64)
-	if err != nil || n < float64(min) {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < min {
 		return fallback
 	}
-	return int(n)
+	return n
 }
 
-func FirstString(names []string, fallback string) string {
+// EnvFirstString returns the first non-empty env value among names.
+func EnvFirstString(names []string, fallback string) string {
 	for _, name := range names {
-		if value := os.Getenv(name); value != "" {
-			return value
+		if v := os.Getenv(name); v != "" {
+			return v
 		}
 	}
 	return fallback
 }
 
-func OptionalInt(names []string, minValue ...int) (int, bool) {
-	min := 1
-	if len(minValue) > 0 {
-		min = minValue[0]
-	}
+// EnvOptionalInt returns the first valid int >= min among names, or nil.
+func EnvOptionalInt(names []string, min int) *int {
 	for _, name := range names {
 		raw := os.Getenv(name)
 		if raw == "" {
 			continue
 		}
-		n, err := strconv.ParseFloat(raw, 64)
-		if err == nil && n >= float64(min) {
-			return int(n), true
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < min {
+			continue
 		}
+		v := n
+		return &v
 	}
-	return 0, false
+	return nil
 }
 
+const TakaraAPIKeyEnv = "TAKARA_API_KEY"
+
+var takaraAPIKeyPlaceholders = map[string]struct{}{
+	"${TAKARA_API_KEY}": {},
+	"$TAKARA_API_KEY":   {},
+}
+
+// IsUsableTakaraAPIKey reports a real key (not empty/placeholder).
+func IsUsableTakaraAPIKey(value string) bool {
+	key := strings.TrimSpace(value)
+	if key == "" {
+		return false
+	}
+	_, placeholder := takaraAPIKeyPlaceholders[key]
+	return !placeholder
+}
+
+// NormalizeTakaraAPIKeyEnv drops placeholder values so credentials.json can supply the key.
+func NormalizeTakaraAPIKeyEnv() {
+	if !IsUsableTakaraAPIKey(os.Getenv(TakaraAPIKeyEnv)) {
+		_ = os.Unsetenv(TakaraAPIKeyEnv)
+	}
+}
+
+// HasTakaraAPIKeyInEnv reports whether a usable Takara key is already in the environment.
 func HasTakaraAPIKeyInEnv() bool {
-	return strings.TrimSpace(os.Getenv(TakaraAPIKeyEnv)) != ""
+	return IsUsableTakaraAPIKey(os.Getenv(TakaraAPIKeyEnv))
 }
 
+// ResolveEmbeddingAPIKey returns TAKARA_API_KEY or an error.
 func ResolveEmbeddingAPIKey() (string, error) {
 	key := strings.TrimSpace(os.Getenv(TakaraAPIKeyEnv))
-	if key == "" {
-		return "", fmt.Errorf("Takara API key required. Run `miru setup`, or set TAKARA_API_KEY in your MCP server env or .env.local")
+	if !IsUsableTakaraAPIKey(key) {
+		return "", errMissingAPIKey
 	}
 	return key, nil
 }
+
+// IsSageMakerConfigured reports whether SageMaker embedding env is set.
+func IsSageMakerConfigured() bool {
+	return strings.TrimSpace(os.Getenv("MIRU_SAGEMAKER_ENDPOINT_ARN")) != "" ||
+		strings.TrimSpace(os.Getenv("MIRU_SAGEMAKER_ENDPOINT_NAME")) != ""
+}
+
+type missingAPIKeyError struct{}
+
+func (missingAPIKeyError) Error() string {
+	return "Takara credentials required. If you're an agent with Miru MCP tools available, call the " +
+		"`auth` tool to sign in. Otherwise run `miru setup`, or set TAKARA_API_KEY in your MCP " +
+		"server env or .env.local."
+}
+
+var errMissingAPIKey = missingAPIKeyError{}

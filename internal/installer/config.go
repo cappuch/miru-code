@@ -4,224 +4,259 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 )
 
-const (
-	MiruStart = "<!-- miru:start -->"
-	MiruEnd   = "<!-- miru:end -->"
-
-	codexMCPHeader = "[mcp_servers.miru]"
-	codexMCPBlock  = `[mcp_servers.miru]
-command = "miru"
-env = { TAKARA_API_KEY = "${TAKARA_API_KEY}" }
-`
-)
-
-type Action string
-
-const (
-	ActionCreated   Action = "created"
-	ActionUpdated   Action = "updated"
-	ActionUnchanged Action = "unchanged"
-	ActionNotFound  Action = "not-found"
-	ActionRemoved   Action = "removed"
-	ActionError     Action = "error"
-)
-
+// StripJSONComments removes // and /* */ comments outside strings.
 func StripJSONComments(text string) string {
 	var out strings.Builder
 	inString := false
-	var quote byte = '"'
-	for i := 0; i < len(text); {
+	stringQuote := byte('"')
+	for i := 0; i < len(text); i++ {
 		ch := text[i]
-		next := byte(0)
+		var next byte
 		if i+1 < len(text) {
 			next = text[i+1]
 		}
 		if inString {
 			out.WriteByte(ch)
 			if ch == '\\' && i+1 < len(text) {
-				out.WriteByte(next)
-				i += 2
+				out.WriteByte(text[i+1])
+				i++
 				continue
 			}
-			if ch == quote {
+			if ch == stringQuote {
 				inString = false
 			}
-			i++
 			continue
 		}
 		if ch == '"' || ch == '\'' {
 			inString = true
-			quote = ch
+			stringQuote = ch
 			out.WriteByte(ch)
-			i++
 			continue
 		}
 		if ch == '/' && next == '/' {
 			for i < len(text) && text[i] != '\n' {
 				i++
 			}
+			if i < len(text) {
+				i--
+			}
 			continue
 		}
 		if ch == '/' && next == '*' {
 			i += 2
-			for i+1 < len(text) && !(text[i] == '*' && text[i+1] == '/') {
+			for i < len(text) && !(text[i] == '*' && i+1 < len(text) && text[i+1] == '/') {
 				i++
 			}
-			if i+1 < len(text) {
-				i += 2
-			}
+			i++ // skip '/'
 			continue
 		}
 		out.WriteByte(ch)
-		i++
 	}
 	return out.String()
 }
 
-func MergeJSONMember(path, sectionKey, memberKey string, value map[string]any) Action {
-	existed := fileExists(path)
-	text := ""
-	if existed {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return ActionError
+func parseJSONObject(text string) (map[string]any, bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return map[string]any{}, true
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(StripJSONComments(trimmed)), &parsed); err != nil {
+		return nil, false
+	}
+	m, ok := parsed.(map[string]any)
+	return m, ok
+}
+
+func ensureTrailingNewline(text string) string {
+	if strings.HasSuffix(text, "\n") {
+		return text
+	}
+	return text + "\n"
+}
+
+func withMergedMember(root map[string]any, sectionKey, memberKey string, value map[string]any) map[string]any {
+	next := map[string]any{}
+	for k, v := range root {
+		next[k] = v
+	}
+	section := map[string]any{}
+	if existing, ok := next[sectionKey].(map[string]any); ok {
+		for k, v := range existing {
+			section[k] = v
 		}
+	}
+	section[memberKey] = value
+	next[sectionKey] = section
+	return next
+}
+
+func withRemovedMember(root map[string]any, sectionKey, memberKey string) map[string]any {
+	next := map[string]any{}
+	for k, v := range root {
+		next[k] = v
+	}
+	section, ok := next[sectionKey].(map[string]any)
+	if !ok {
+		return next
+	}
+	sec := map[string]any{}
+	for k, v := range section {
+		if k != memberKey {
+			sec[k] = v
+		}
+	}
+	if len(sec) == 0 {
+		delete(next, sectionKey)
+	} else {
+		next[sectionKey] = sec
+	}
+	return next
+}
+
+// MergeJSONMember upserts section.memberKey = value in a JSON config file.
+func MergeJSONMember(path, sectionKey, memberKey string, value map[string]any) (InstallAction, error) {
+	existed := false
+	text := ""
+	if data, err := os.ReadFile(path); err == nil {
+		existed = true
 		text = string(data)
 	}
 	parsed, ok := parseJSONObject(text)
 	if !ok {
-		return ActionError
+		return ActionError, nil
 	}
-	section, ok := sectionObject(parsed, sectionKey)
-	if !ok {
-		return ActionError
+	section, _ := parsed[sectionKey].(map[string]any)
+	if section == nil {
+		section = map[string]any{}
 	}
-	if reflect.DeepEqual(section[memberKey], value) {
-		return ActionUnchanged
+	if existing, ok := section[memberKey].(map[string]any); ok {
+		a, _ := json.Marshal(existing)
+		b, _ := json.Marshal(value)
+		if string(a) == string(b) {
+			return ActionUnchanged, nil
+		}
 	}
-	section[memberKey] = value
-	parsed[sectionKey] = section
-	data, err := json.MarshalIndent(parsed, "", "  ")
+	next := withMergedMember(parsed, sectionKey, memberKey, value)
+	data, err := json.MarshalIndent(next, "", "  ")
 	if err != nil {
-		return ActionError
+		return ActionError, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return ActionError
+		return ActionError, err
 	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
-		return ActionError
+	if err := os.WriteFile(path, []byte(ensureTrailingNewline(string(data))), 0o644); err != nil {
+		return ActionError, err
 	}
 	if existed {
-		return ActionUpdated
+		return ActionUpdated, nil
 	}
-	return ActionCreated
+	return ActionCreated, nil
 }
 
-func RemoveJSONMember(path, sectionKey, memberKey string) Action {
-	if !fileExists(path) {
-		return ActionNotFound
-	}
+// RemoveJSONMember removes section.memberKey from a JSON config file.
+func RemoveJSONMember(path, sectionKey, memberKey string) (InstallAction, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return ActionError
+		if os.IsNotExist(err) {
+			return ActionNotFound, nil
+		}
+		return ActionError, err
 	}
 	parsed, ok := parseJSONObject(string(data))
 	if !ok {
-		return ActionError
+		return ActionError, nil
 	}
-	section, ok := sectionObject(parsed, sectionKey)
-	if !ok {
-		return ActionError
+	section, _ := parsed[sectionKey].(map[string]any)
+	if section == nil {
+		return ActionNotFound, nil
 	}
-	if _, exists := section[memberKey]; !exists {
-		return ActionNotFound
+	if _, ok := section[memberKey]; !ok {
+		return ActionNotFound, nil
 	}
-	delete(section, memberKey)
-	if len(section) == 0 {
-		delete(parsed, sectionKey)
-	} else {
-		parsed[sectionKey] = section
+	next := withRemovedMember(parsed, sectionKey, memberKey)
+	if len(next) == 0 {
+		_ = os.Remove(path)
+		return ActionRemoved, nil
 	}
-	if len(parsed) == 0 {
-		if err := os.Remove(path); err != nil {
-			return ActionError
-		}
-		return ActionRemoved
-	}
-	next, err := json.MarshalIndent(parsed, "", "  ")
+	out, err := json.MarshalIndent(next, "", "  ")
 	if err != nil {
-		return ActionError
+		return ActionError, err
 	}
-	if err := os.WriteFile(path, append(next, '\n'), 0o644); err != nil {
-		return ActionError
+	if err := os.WriteFile(path, []byte(ensureTrailingNewline(string(out))), 0o644); err != nil {
+		return ActionError, err
 	}
-	return ActionRemoved
+	return ActionRemoved, nil
 }
 
-func ReplaceOrAppendMarked(path, content string) Action {
-	existed := fileExists(path)
+// ReplaceOrAppendMarked writes/updates a <!-- miru:start --> block.
+func ReplaceOrAppendMarked(path, content string) (InstallAction, error) {
+	existed := false
 	existing := ""
-	if existed {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return ActionError
-		}
+	if data, err := os.ReadFile(path); err == nil {
+		existed = true
 		existing = string(data)
 	}
-	start := strings.Index(existing, MiruStart)
-	end := strings.Index(existing, MiruEnd)
-	if start != -1 && end != -1 && end > start {
-		before := existing[:start]
-		after := existing[end+len(MiruEnd):]
-		updated := before + strings.TrimSpace(content) + "\n" + strings.TrimLeft(after, "\n")
+	startIdx := strings.Index(existing, MiruStart)
+	endIdx := strings.Index(existing, MiruEnd)
+	if startIdx != -1 && endIdx != -1 && endIdx > startIdx {
+		before := existing[:startIdx]
+		after := existing[endIdx+len(MiruEnd):]
+		after = strings.TrimLeft(after, "\n")
+		updated := before + strings.TrimSpace(content) + "\n" + after
 		if updated == existing {
-			return ActionUnchanged
+			return ActionUnchanged, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return ActionError, err
 		}
 		if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
-			return ActionError
+			return ActionError, err
 		}
-		return ActionUpdated
+		return ActionUpdated, nil
 	}
 	separator := ""
-	if existing != "" && !strings.HasSuffix(existing, "\n\n") {
-		if strings.HasSuffix(existing, "\n") {
+	if existing != "" {
+		if strings.HasSuffix(existing, "\n\n") {
+			separator = ""
+		} else if strings.HasSuffix(existing, "\n") {
 			separator = "\n"
 		} else {
 			separator = "\n\n"
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return ActionError
+		return ActionError, err
 	}
 	if err := os.WriteFile(path, []byte(existing+separator+content), 0o644); err != nil {
-		return ActionError
+		return ActionError, err
 	}
 	if existed {
-		return ActionUpdated
+		return ActionUpdated, nil
 	}
-	return ActionCreated
+	return ActionCreated, nil
 }
 
-func RemoveMarked(path string) Action {
-	if !fileExists(path) {
-		return ActionNotFound
-	}
+// RemoveMarked removes a <!-- miru:start --> block.
+func RemoveMarked(path string) (InstallAction, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return ActionError
+		if os.IsNotExist(err) {
+			return ActionNotFound, nil
+		}
+		return ActionError, err
 	}
 	existing := string(data)
-	start := strings.Index(existing, MiruStart)
-	end := strings.Index(existing, MiruEnd)
-	if start == -1 || end == -1 || end <= start {
-		return ActionNotFound
+	startIdx := strings.Index(existing, MiruStart)
+	endIdx := strings.Index(existing, MiruEnd)
+	if startIdx == -1 || endIdx == -1 || endIdx <= startIdx {
+		return ActionNotFound, nil
 	}
-	before := strings.TrimRight(existing[:start], "\n")
-	after := strings.TrimLeft(existing[end+len(MiruEnd):], "\n")
+	before := strings.TrimRight(existing[:startIdx], "\n")
+	after := strings.TrimLeft(existing[endIdx+len(MiruEnd):], "\n")
 	parts := []string{}
 	if before != "" {
 		parts = append(parts, before)
@@ -231,107 +266,28 @@ func RemoveMarked(path string) Action {
 	}
 	updated := strings.Join(parts, "\n")
 	if strings.TrimSpace(updated) == "" {
-		if err := os.Remove(path); err != nil {
-			return ActionError
-		}
-		return ActionRemoved
+		_ = os.Remove(path)
+		return ActionRemoved, nil
 	}
 	if err := os.WriteFile(path, []byte(updated+"\n"), 0o644); err != nil {
-		return ActionError
+		return ActionError, err
 	}
-	return ActionRemoved
+	return ActionRemoved, nil
 }
 
-func MergeTOMLBlock(path string) Action {
-	existed := fileExists(path)
-	existing := ""
-	if existed {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return ActionError
-		}
-		existing = string(data)
-	}
-	if strings.Contains(existing, strings.TrimSpace(codexMCPBlock)) {
-		return ActionUnchanged
-	}
-	base := strings.TrimRight(stripTOMLSection(existing, codexMCPHeader), "\n")
-	next := codexMCPBlock
-	if base != "" {
-		next = base + "\n\n" + codexMCPBlock
-	}
-	if !strings.HasSuffix(next, "\n") {
-		next += "\n"
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return ActionError
-	}
-	if err := os.WriteFile(path, []byte(next), 0o644); err != nil {
-		return ActionError
-	}
-	if existed {
-		return ActionUpdated
-	}
-	return ActionCreated
-}
+const codexMCPHeader = "[mcp_servers.miru]"
 
-func RemoveTOMLBlock(path string) Action {
-	if !fileExists(path) {
-		return ActionNotFound
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ActionError
-	}
-	existing := string(data)
-	if !strings.Contains(existing, codexMCPHeader) {
-		return ActionNotFound
-	}
-	remaining := strings.TrimSpace(stripTOMLSection(existing, codexMCPHeader))
-	if remaining == "" {
-		if err := os.Remove(path); err != nil {
-			return ActionError
-		}
-		return ActionRemoved
-	}
-	if err := os.WriteFile(path, []byte(remaining+"\n"), 0o644); err != nil {
-		return ActionError
-	}
-	return ActionRemoved
-}
-
-func parseJSONObject(text string) (map[string]any, bool) {
-	if strings.TrimSpace(text) == "" {
-		return map[string]any{}, true
-	}
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(StripJSONComments(text)), &parsed); err != nil {
-		return nil, false
-	}
-	if parsed == nil {
-		return nil, false
-	}
-	return parsed, true
-}
-
-func sectionObject(root map[string]any, sectionKey string) (map[string]any, bool) {
-	section, exists := root[sectionKey]
-	if !exists {
-		return map[string]any{}, true
-	}
-	obj, ok := section.(map[string]any)
-	return obj, ok
-}
-
-func stripTOMLSection(text, header string) string {
-	prefix := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(header), "["), "]")
+func stripTomlSection(text, header string) string {
+	prefix := strings.TrimSpace(header)
+	prefix = strings.TrimPrefix(prefix, "[")
+	prefix = strings.TrimSuffix(prefix, "]")
 	lines := strings.Split(text, "\n")
-	result := []string{}
+	var result []string
 	skipping := false
 	for _, line := range lines {
-		tableKey := strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+		tableKey := strings.TrimSpace(strings.Split(line, "#")[0])
 		if strings.HasPrefix(tableKey, "[") && strings.HasSuffix(tableKey, "]") {
-			tableName := strings.TrimSuffix(strings.TrimPrefix(tableKey, "["), "]")
+			tableName := tableKey[1 : len(tableKey)-1]
 			if tableName == prefix || strings.HasPrefix(tableName, prefix+".") {
 				skipping = true
 				continue
@@ -345,7 +301,176 @@ func stripTOMLSection(text, header string) string {
 	return strings.Join(result, "\n")
 }
 
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+// MergeTomlBlock installs the Codex miru MCP block.
+func MergeTomlBlock(path string) (InstallAction, error) {
+	existed := false
+	existing := ""
+	if data, err := os.ReadFile(path); err == nil {
+		existed = true
+		existing = string(data)
+	}
+	defaultBlock := strings.TrimSpace(CodexTOMLBlock(false))
+	benchmarkBlock := strings.TrimSpace(CodexTOMLBlock(true))
+	if strings.Contains(existing, defaultBlock) || strings.Contains(existing, benchmarkBlock) {
+		return ActionUnchanged, nil
+	}
+	preserveBenchmark := strings.Contains(existing, codexMCPHeader) &&
+		(strings.Contains(existing, `"--benchmark"`) || strings.Contains(existing, `'--benchmark'`))
+	block := CodexTOMLBlock(preserveBenchmark)
+	base := strings.TrimRight(stripTomlSection(existing, codexMCPHeader), "\n")
+	var next string
+	if base != "" {
+		next = base + "\n\n" + block
+	} else {
+		next = block
+	}
+	if !strings.HasSuffix(next, "\n") {
+		next += "\n"
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return ActionError, err
+	}
+	if err := os.WriteFile(path, []byte(next), 0o644); err != nil {
+		return ActionError, err
+	}
+	if existed {
+		return ActionUpdated, nil
+	}
+	return ActionCreated, nil
+}
+
+// RemoveTomlBlock removes the Codex miru MCP block.
+func RemoveTomlBlock(path string) (InstallAction, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ActionNotFound, nil
+		}
+		return ActionError, err
+	}
+	existing := string(data)
+	if !strings.Contains(existing, codexMCPHeader) {
+		return ActionNotFound, nil
+	}
+	remaining := strings.TrimSpace(stripTomlSection(existing, codexMCPHeader))
+	if remaining == "" {
+		_ = os.Remove(path)
+		return ActionRemoved, nil
+	}
+	if err := os.WriteFile(path, []byte(remaining+"\n"), 0o644); err != nil {
+		return ActionError, err
+	}
+	return ActionRemoved, nil
+}
+
+// CodexSkillsFeatureEnabled reports whether [features] skills = true is set in Codex config.toml.
+func CodexSkillsFeatureEnabled(text string) bool {
+	lines := strings.Split(text, "\n")
+	inFeatures := false
+	for _, line := range lines {
+		tableKey := strings.TrimSpace(strings.Split(line, "#")[0])
+		if strings.HasPrefix(tableKey, "[") && strings.HasSuffix(tableKey, "]") {
+			inFeatures = tableKey == "[features]"
+			continue
+		}
+		if !inFeatures {
+			continue
+		}
+		parts := strings.Split(line, "#")
+		trimmed := strings.TrimSpace(parts[0])
+		if len(trimmed) >= 5 && strings.HasPrefix(strings.ToLower(trimmed), "skills") {
+			if strings.Contains(strings.ToLower(trimmed), "true") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// EnsureCodexSkillsFeature ensures [features] skills = true in Codex config.toml.
+func EnsureCodexSkillsFeature(path string) (InstallAction, error) {
+	existed := false
+	existing := ""
+	if data, err := os.ReadFile(path); err == nil {
+		existed = true
+		existing = string(data)
+	} else if !os.IsNotExist(err) {
+		return ActionError, err
+	}
+	if CodexSkillsFeatureEnabled(existing) {
+		return ActionUnchanged, nil
+	}
+
+	var lines []string
+	if existing != "" {
+		lines = strings.Split(existing, "\n")
+	}
+
+	featuresIdx := -1
+	skillsIdx := -1
+	inFeatures := false
+	for i, line := range lines {
+		tableKey := strings.TrimSpace(strings.Split(line, "#")[0])
+		if strings.HasPrefix(tableKey, "[") && strings.HasSuffix(tableKey, "]") {
+			if tableKey == "[features]" {
+				inFeatures = true
+				featuresIdx = i
+				continue
+			}
+			inFeatures = false
+			continue
+		}
+		if inFeatures {
+			parts := strings.Split(line, "#")
+			if strings.Contains(strings.TrimSpace(parts[0]), "skills") {
+				skillsIdx = i
+			}
+		}
+	}
+
+	writeLines := func() (InstallAction, error) {
+		next := strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n"
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return ActionError, err
+		}
+		if err := os.WriteFile(path, []byte(next), 0o644); err != nil {
+			return ActionError, err
+		}
+		if existed {
+			return ActionUpdated, nil
+		}
+		return ActionCreated, nil
+	}
+
+	if featuresIdx >= 0 && skillsIdx >= 0 {
+		lines[skillsIdx] = "skills = true"
+		return writeLines()
+	}
+	if featuresIdx >= 0 {
+		insert := append([]string{"skills = true"}, lines[featuresIdx+1:]...)
+		lines = append(lines[:featuresIdx+1], insert...)
+		return writeLines()
+	}
+
+	block := "[features]\nskills = true\n"
+	base := strings.TrimRight(existing, "\n")
+	var next string
+	if base != "" {
+		next = base + "\n\n" + block
+	} else {
+		next = block
+	}
+	if !strings.HasSuffix(next, "\n") {
+		next += "\n"
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return ActionError, err
+	}
+	if err := os.WriteFile(path, []byte(next), 0o644); err != nil {
+		return ActionError, err
+	}
+	if existed {
+		return ActionUpdated, nil
+	}
+	return ActionCreated, nil
 }

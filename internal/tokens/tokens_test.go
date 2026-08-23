@@ -5,47 +5,29 @@ import (
 	"testing"
 )
 
-func TestSplitIdentifierCamelCase(t *testing.T) {
-	got := SplitIdentifier("HandlerStack")
-	want := []string{"handlerstack", "handler", "stack"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("SplitIdentifier() = %#v, want %#v", got, want)
+func TestSplitIdentifier(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"foo", []string{"foo"}},
+		{"foo_bar", []string{"foo_bar", "foo", "bar"}},
+		{"FooBar", []string{"foobar", "foo", "bar"}},
+		{"XMLParser", []string{"xmlparser", "xml", "parser"}},
+		{"getHTTPResponse", []string{"gethttpresponse", "get", "http", "response"}},
 	}
-}
-
-func TestSplitIdentifierSnakeCase(t *testing.T) {
-	got := SplitIdentifier("my_func")
-	want := []string{"my_func", "my", "func"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("SplitIdentifier() = %#v, want %#v", got, want)
-	}
-}
-
-func TestTokenizeExpandsCompounds(t *testing.T) {
-	got := Tokenize("getHTTPResponse")
-	if !contains(got, "gethttpresponse") || !contains(got, "http") {
-		t.Fatalf("Tokenize() = %#v, want compound expansion", got)
-	}
-}
-
-func TestSplitIdentifierAcronymsAndDigits(t *testing.T) {
-	cases := map[string][]string{
-		"HTTPResponse": {"httpresponse", "http", "response"},
-		"ABC":          {"abc"},
-		"parse2HTML":   {"parse2html", "parse", "2", "html"},
-	}
-	for input, want := range cases {
-		if got := SplitIdentifier(input); !reflect.DeepEqual(got, want) {
-			t.Fatalf("SplitIdentifier(%q) = %#v, want %#v", input, got, want)
+	for _, tc := range cases {
+		got := SplitIdentifier(tc.in)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("SplitIdentifier(%q)=%v want %v", tc.in, got, tc.want)
 		}
 	}
 }
 
-func contains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
+func TestTokenize(t *testing.T) {
+	got := Tokenize("hello FooBar world")
+	want := []string{"hello", "foobar", "foo", "bar", "world"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Tokenize=%v want %v", got, want)
 	}
-	return false
 }

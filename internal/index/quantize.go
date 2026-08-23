@@ -2,200 +2,210 @@ package index
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 )
 
-type QuantizedVector struct {
-	Codes []int8
-	Scale float64
-}
-
+// QuantizeVector performs symmetric int8 quantization (matches quantize.ts).
 func QuantizeVector(vector []float32) QuantizedVector {
-	var maxAbs float32
-	for _, value := range vector {
-		abs := float32(math.Abs(float64(value)))
-		if abs > maxAbs {
-			maxAbs = abs
+	maxAbs := float32(0)
+	for _, v := range vector {
+		a := v
+		if a < 0 {
+			a = -a
+		}
+		if a > maxAbs {
+			maxAbs = a
 		}
 	}
-
 	scale := float64(1)
-	codes := make([]int8, len(vector))
 	if maxAbs > 0 {
 		scale = float64(maxAbs) / 127
-		inv := 127 / float64(maxAbs)
-		for i, value := range vector {
-			rounded := jsRound(float64(value) * inv)
-			codes[i] = int8(max(-127, min(127, int(rounded))))
+	}
+	codes := make([]int8, len(vector))
+	if maxAbs > 0 {
+		inv := float32(127) / maxAbs
+		for i, v := range vector {
+			r := math.Round(float64(v * inv))
+			if r > 127 {
+				r = 127
+			}
+			if r < -127 {
+				r = -127
+			}
+			codes[i] = int8(r)
 		}
 	}
 	return QuantizedVector{Codes: codes, Scale: scale}
 }
 
+// QuantizedVectorIndex is the production semantic index.
 type QuantizedVectorIndex struct {
-	codes  [][]int8
+	codes  []int8
 	scales []float32
+	count  int
 	dim    int
 }
 
+// NewQuantizedVectorIndex builds from float32 vectors.
 func NewQuantizedVectorIndex(vectors [][]float32) *QuantizedVectorIndex {
 	if len(vectors) == 0 {
 		return &QuantizedVectorIndex{}
 	}
-
 	dim := len(vectors[0])
-	codes := make([][]int8, len(vectors))
+	codes := make([]int8, len(vectors)*dim)
 	scales := make([]float32, len(vectors))
 	for i, vector := range vectors {
-		quantized := QuantizeVector(vector)
-		codes[i] = quantized.Codes
-		scales[i] = float32(quantized.Scale)
+		qv := QuantizeVector(vector)
+		copy(codes[i*dim:], qv.Codes)
+		scales[i] = float32(qv.Scale)
 	}
-	return &QuantizedVectorIndex{codes: codes, scales: scales, dim: dim}
+	return &QuantizedVectorIndex{
+		codes:  codes,
+		scales: scales,
+		count:  len(vectors),
+		dim:    dim,
+	}
 }
 
-func NewQuantizedVectorIndexFromPersisted(codes [][]int8, scales []float32, dim int) *QuantizedVectorIndex {
-	return &QuantizedVectorIndex{codes: codes, scales: scales, dim: dim}
+// QuantizedFromPersisted restores an index from raw buffers.
+func QuantizedFromPersisted(codes []int8, scales []float32, count, dim int) *QuantizedVectorIndex {
+	return &QuantizedVectorIndex{codes: codes, scales: scales, count: count, dim: dim}
 }
 
-func (q *QuantizedVectorIndex) Size() int {
-	return len(q.codes)
-}
+func (q *QuantizedVectorIndex) Size() int        { return q.count }
+func (q *QuantizedVectorIndex) Dimensions() int  { return q.dim }
+func (q *QuantizedVectorIndex) MemoryBytes() int { return q.count*q.dim + len(q.scales)*4 }
+func (q *QuantizedVectorIndex) Storage() SemanticStorage { return StorageInt8 }
 
-func (q *QuantizedVectorIndex) Dimensions() int {
-	return q.dim
-}
-
-func (q *QuantizedVectorIndex) MemoryBytes() int {
-	return len(q.codes)*q.dim + len(q.scales)*4
-}
-
+// VectorAt dequantizes and re-normalizes.
 func (q *QuantizedVectorIndex) VectorAt(docIndex int) ([]float32, error) {
-	if docIndex < 0 || docIndex >= len(q.codes) || docIndex >= len(q.scales) {
-		return nil, fmt.Errorf("missing quantized vector at index %d", docIndex)
+	if docIndex < 0 || docIndex >= q.count {
+		return nil, fmt.Errorf("Missing quantized vector at index %d", docIndex)
 	}
-
-	out := make([]float32, len(q.codes[docIndex]))
+	offset := docIndex * q.dim
 	scale := q.scales[docIndex]
-	for i, code := range q.codes[docIndex] {
-		out[i] = float32(code) * scale
+	out := make([]float32, q.dim)
+	for i := 0; i < q.dim; i++ {
+		out[i] = float32(q.codes[offset+i]) * scale
 	}
-
 	var norm float64
-	for _, value := range out {
-		norm += float64(value) * float64(value)
+	for _, v := range out {
+		norm += float64(v) * float64(v)
 	}
 	norm = math.Sqrt(norm)
 	if norm > 0 {
-		for i, value := range out {
-			out[i] = float32(float64(value) / norm)
+		for i := range out {
+			out[i] = float32(float64(out[i]) / norm)
 		}
 	}
 	return out, nil
 }
 
-func (q *QuantizedVectorIndex) Query(queryVector []float32, k int, selector ...[]int) (QueryResult, error) {
+// QueryResult holds indices and distances.
+type QueryResult struct {
+	Indices   []int
+	Distances []float64
+}
+
+// Query returns top-k by cosine distance (1 - int8 similarity).
+func (q *QuantizedVectorIndex) Query(queryVector []float32, k int, selector []int) (QueryResult, error) {
 	if k < 1 {
 		return QueryResult{}, fmt.Errorf("k should be >= 1, is now %d", k)
 	}
-	if q.Size() == 0 {
+	if q.count == 0 {
 		return QueryResult{}, nil
 	}
-
-	query := QuantizeVector(queryVector)
-	indices := make([]int, q.Size())
-	for i := range indices {
-		indices[i] = i
+	qv := QuantizeVector(queryVector)
+	maxN := q.count
+	if selector != nil {
+		maxN = len(selector)
 	}
-	if len(selector) > 0 && selector[0] != nil {
-		indices = selector[0]
+	effectiveK := k
+	if effectiveK > maxN {
+		effectiveK = maxN
 	}
-	effectiveK := min(k, len(indices))
 	if effectiveK == 0 {
 		return QueryResult{}, nil
 	}
-
-	entries := make([]TopKDistanceEntry, 0, len(indices))
-	for _, idx := range indices {
-		if idx < 0 || idx >= len(q.codes) || idx >= len(q.scales) {
-			continue
+	collector := NewTopKDistanceCollector(effectiveK)
+	if selector != nil {
+		for _, idx := range selector {
+			if idx < 0 || idx >= q.count {
+				continue
+			}
+			sim := QuantizedDotFlat(qv, q.codes, idx*q.dim, q.dim, float64(q.scales[idx]))
+			collector.Offer(idx, 1-sim)
 		}
-		similarity := quantizedDot(query, q.codes[idx], q.scales[idx])
-		entries = append(entries, TopKDistanceEntry{Index: idx, Distance: 1 - similarity})
+	} else {
+		for i := 0; i < q.count; i++ {
+			sim := QuantizedDotFlat(qv, q.codes, i*q.dim, q.dim, float64(q.scales[i]))
+			collector.Offer(i, 1-sim)
+		}
 	}
-	return queryResultFromTop(SelectTopKByDistance(entries, effectiveK)), nil
+	top := collector.Finish()
+	res := QueryResult{Indices: make([]int, len(top)), Distances: make([]float64, len(top))}
+	for i, e := range top {
+		res.Indices[i] = e.Index
+		res.Distances[i] = e.Distance
+	}
+	return res, nil
 }
 
+// Save writes codes.bin, scales.bin, meta.json.
 func (q *QuantizedVectorIndex) Save(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-
-	count := q.Size()
-	dim := q.dim
-	flatCodes := make([]byte, count*dim)
-	for i, codes := range q.codes {
-		for j, code := range codes {
-			flatCodes[i*dim+j] = byte(code)
-		}
+	codeBytes := make([]byte, len(q.codes))
+	for i, c := range q.codes {
+		codeBytes[i] = byte(c)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "codes.bin"), flatCodes, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "codes.bin"), codeBytes, 0o644); err != nil {
 		return err
 	}
-
 	scaleBytes := make([]byte, len(q.scales)*4)
-	for i, scale := range q.scales {
-		binary.LittleEndian.PutUint32(scaleBytes[i*4:], math.Float32bits(scale))
+	for i, s := range q.scales {
+		binary.LittleEndian.PutUint32(scaleBytes[i*4:], math.Float32bits(s))
 	}
 	if err := os.WriteFile(filepath.Join(dir, "scales.bin"), scaleBytes, 0o644); err != nil {
 		return err
 	}
-	return writeMeta(dir, semanticMeta{Count: count, Dimensions: dim, Storage: "int8"})
+	meta, _ := json.Marshal(map[string]any{"count": q.count, "dimensions": q.dim, "storage": "int8"})
+	return os.WriteFile(filepath.Join(dir, "meta.json"), meta, 0o644)
 }
 
-func LoadQuantizedVectorIndex(dir string) (*QuantizedVectorIndex, error) {
-	meta, err := readMeta(dir)
+// LoadQuantized loads from disk.
+func LoadQuantized(dir string) (*QuantizedVectorIndex, error) {
+	metaBytes, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
 		return nil, err
 	}
-	rawCodes, err := os.ReadFile(filepath.Join(dir, "codes.bin"))
+	var meta struct {
+		Count      int `json:"count"`
+		Dimensions int `json:"dimensions"`
+	}
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return nil, err
+	}
+	codeBytes, err := os.ReadFile(filepath.Join(dir, "codes.bin"))
 	if err != nil {
 		return nil, err
 	}
-	rawScales, err := os.ReadFile(filepath.Join(dir, "scales.bin"))
+	codes := make([]int8, len(codeBytes))
+	for i, b := range codeBytes {
+		codes[i] = int8(b)
+	}
+	scaleBytes, err := os.ReadFile(filepath.Join(dir, "scales.bin"))
 	if err != nil {
 		return nil, err
 	}
-
-	codes := make([][]int8, meta.Count)
-	for i := 0; i < meta.Count; i++ {
-		codes[i] = make([]int8, meta.Dimensions)
-		for j := 0; j < meta.Dimensions; j++ {
-			codes[i][j] = int8(rawCodes[i*meta.Dimensions+j])
-		}
+	scales := make([]float32, len(scaleBytes)/4)
+	for i := range scales {
+		scales[i] = math.Float32frombits(binary.LittleEndian.Uint32(scaleBytes[i*4:]))
 	}
-	scales := make([]float32, meta.Count)
-	for i := 0; i < meta.Count; i++ {
-		scales[i] = math.Float32frombits(binary.LittleEndian.Uint32(rawScales[i*4:]))
-	}
-	return NewQuantizedVectorIndexFromPersisted(codes, scales, meta.Dimensions), nil
-}
-
-func quantizedDot(query QuantizedVector, docCodes []int8, docScale float32) float64 {
-	sum := 0
-	for i, qCode := range query.Codes {
-		var docCode int8
-		if i < len(docCodes) {
-			docCode = docCodes[i]
-		}
-		sum += int(qCode) * int(docCode)
-	}
-	return float64(sum) * query.Scale * float64(docScale)
-}
-
-func jsRound(value float64) float64 {
-	return math.Floor(value + 0.5)
+	return QuantizedFromPersisted(codes, scales, meta.Count, meta.Dimensions), nil
 }

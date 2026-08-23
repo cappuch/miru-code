@@ -1,198 +1,226 @@
 package search
 
 import (
-	"regexp"
 	"sort"
 	"strings"
 
-	"github.com/takara-ai/miru-code/internal/embeddings"
+	"github.com/takara-ai/miru-code/internal/embed"
 	"github.com/takara-ai/miru-code/internal/index"
+	"github.com/takara-ai/miru-code/internal/ranking"
 	"github.com/takara-ai/miru-code/internal/tokens"
-	"github.com/takara-ai/miru-code/internal/utils"
+	"github.com/takara-ai/miru-code/internal/types"
 )
 
 const rrfK = 60
 
-var (
-	qualifiedSymbolPartRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	camelOrSymbolRE       = regexp.MustCompile(`^(?:_(?:[A-Za-z0-9_]*)|(?:[A-Za-z][A-Za-z0-9]*[A-Z_][A-Za-z0-9_]*)|(?:[A-Z][A-Za-z0-9]*))$`)
-)
-
-func IsSymbolQuery(query string) bool {
-	q := strings.TrimSpace(query)
-	if strings.Contains(q, "::") || strings.Contains(q, "\\") || strings.Contains(q, "->") || strings.Contains(q, ".") {
-		parts := strings.FieldsFunc(q, func(r rune) bool {
-			return r == ':' || r == '\\' || r == '-' || r == '>' || r == '.'
-		})
-		if len(parts) < 2 {
-			return false
-		}
-		for _, part := range parts {
-			if part == "" || !qualifiedSymbolPartRE.MatchString(part) {
-				return false
-			}
-		}
-		return true
-	}
-	return camelOrSymbolRE.MatchString(q)
-}
-
-func ResolveAlpha(query string, alpha *float64) float64 {
-	if alpha != nil {
-		return *alpha
-	}
-	if IsSymbolQuery(query) {
-		return 0.3
-	}
-	return 0.5
-}
-
-type HybridOptions struct {
-	Query         string
-	Embeddings    embeddings.Backend
-	SemanticIndex index.SemanticIndex
-	BM25Index     *index.BM25Index
-	Chunks        []utils.Chunk
-	TopK          int
-	Alpha         *float64
-	Selector      []int
-	Rerank        bool
-}
-
-func HybridSearch(options HybridOptions) ([]utils.SearchResult, error) {
-	topK := options.TopK
-	if topK == 0 {
-		topK = 10
-	}
-	alphaWeight := ResolveAlpha(options.Query, options.Alpha)
-	candidateCount := topK * 5
-	chunksByKey := map[string]utils.Chunk{}
-	for _, chunk := range options.Chunks {
-		chunksByKey[utils.ChunkKey(chunk)] = chunk
-	}
-
-	queryVec, err := options.Embeddings.EmbedQuery(options.Query)
-	if err != nil {
-		return nil, err
-	}
-	semantic, err := semanticFromQueryVector(queryVec, options.SemanticIndex, options.Chunks, candidateCount, options.Selector)
-	if err != nil {
-		return nil, err
-	}
-	bm25Hits := searchBM25(options.Query, options.BM25Index, options.Chunks, candidateCount, options.Selector)
-
-	semanticScores := map[string]float64{}
-	for _, result := range semantic {
-		semanticScores[utils.ChunkKey(result.Chunk)] = result.Score
-	}
-	bm25Scores := map[string]float64{}
-	for _, result := range bm25Hits {
-		if result.Score != 0 {
-			bm25Scores[utils.ChunkKey(result.Chunk)] = result.Score
-		}
-	}
-
-	normalizedSemantic := rrfScores(semanticScores)
-	normalizedBM25 := rrfScores(bm25Scores)
-	keySet := map[string]bool{}
-	for key := range normalizedSemantic {
-		keySet[key] = true
-	}
-	for key := range normalizedBM25 {
-		keySet[key] = true
-	}
-	keys := make([]string, 0, len(keySet))
-	for key := range keySet {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		return chunksByKey[keys[i]].StartLine < chunksByKey[keys[j]].StartLine
-	})
-
-	combinedScores := map[string]float64{}
-	for _, key := range keys {
-		combinedScores[key] = alphaWeight*normalizedSemantic[key] + (1-alphaWeight)*normalizedBM25[key]
-	}
-	if options.Rerank {
-		BoostMultiChunkFiles(combinedScores, chunksByKey)
-		ApplyQueryBoost(combinedScores, options.Query, options.Chunks, chunksByKey)
-		return RerankTopK(combinedScores, chunksByKey, topK, alphaWeight < 1.0), nil
-	}
-	combined := make([]utils.SearchResult, 0, len(combinedScores))
-	for key, score := range combinedScores {
-		combined = append(combined, utils.SearchResult{Chunk: chunksByKey[key], Score: score})
-	}
-	sort.Slice(combined, func(i, j int) bool {
-		return combined[i].Score > combined[j].Score
-	})
-	if len(combined) > topK {
-		combined = combined[:topK]
-	}
-	return combined, nil
-}
-
-func SearchSemanticOnly(backend embeddings.Backend, semanticIndex index.SemanticIndex, chunks []utils.Chunk, query string, topK int, selector []int) ([]utils.SearchResult, error) {
-	queryVec, err := backend.EmbedQuery(query)
-	if err != nil {
-		return nil, err
-	}
-	return semanticFromQueryVector(queryVec, semanticIndex, chunks, topK, selector)
-}
-
 func rrfScores(scores map[string]float64) map[string]float64 {
-	ranked := make([]struct {
+	if len(scores) == 0 {
+		return scores
+	}
+	type pair struct {
 		key   string
 		score float64
-	}, 0, len(scores))
-	for key, score := range scores {
-		ranked = append(ranked, struct {
-			key   string
-			score float64
-		}{key: key, score: score})
 	}
-	sort.Slice(ranked, func(i, j int) bool {
-		return ranked[i].score > ranked[j].score
-	})
-	out := map[string]float64{}
-	for i, entry := range ranked {
-		out[entry.key] = 1.0 / float64(rrfK+i+1)
+	ranked := make([]pair, 0, len(scores))
+	for k, s := range scores {
+		ranked = append(ranked, pair{k, s})
+	}
+	sort.Slice(ranked, func(i, j int) bool { return ranked[i].score > ranked[j].score })
+	out := make(map[string]float64, len(ranked))
+	for i, p := range ranked {
+		out[p.key] = 1.0 / float64(rrfK+i+1)
 	}
 	return out
 }
 
-func semanticFromQueryVector(queryVec []float32, semanticIndex index.SemanticIndex, chunks []utils.Chunk, topK int, selector []int) ([]utils.SearchResult, error) {
-	result, err := semanticIndex.Query(queryVec, topK, selector)
+func semanticFromQueryVector(
+	queryVec []float32,
+	semanticIndex index.SemanticIndex,
+	chunks []types.Chunk,
+	topK int,
+	selector []int,
+) ([]types.SearchResult, error) {
+	res, err := semanticIndex.Query(queryVec, topK, selector)
 	if err != nil {
 		return nil, err
 	}
-	out := []utils.SearchResult{}
-	for i, idx := range result.Indices {
+	out := make([]types.SearchResult, 0, len(res.Indices))
+	for i, idx := range res.Indices {
 		if idx < 0 || idx >= len(chunks) {
 			continue
 		}
-		distance := 0.0
-		if i < len(result.Distances) {
-			distance = result.Distances[i]
+		dist := 0.0
+		if i < len(res.Distances) {
+			dist = res.Distances[i]
 		}
-		out = append(out, utils.SearchResult{Chunk: chunks[idx], Score: 1.0 - distance})
+		out = append(out, types.SearchResult{Chunk: chunks[idx], Score: 1.0 - dist})
 	}
 	return out, nil
 }
 
-func searchBM25(query string, bm25Index *index.BM25Index, chunks []utils.Chunk, topK int, selector []int) []utils.SearchResult {
-	queryTokens := tokens.Tokenize(query)
-	if len(queryTokens) == 0 || bm25Index == nil {
+func searchBm25(
+	query string,
+	bm25Index *index.BM25Index,
+	chunks []types.Chunk,
+	topK int,
+	selector []int,
+) []types.SearchResult {
+	toks := tokens.Tokenize(query)
+	if len(toks) == 0 {
 		return nil
 	}
 	mask := index.SelectorToMask(selector, len(chunks))
-	scores := bm25Index.GetScores(queryTokens, mask)
+	scores := bm25Index.GetScoresAsync(toks, mask)
 	indices := index.SelectTopKScoreIndices(scores, topK)
-	out := []utils.SearchResult{}
-	for _, idx := range indices {
-		if idx < 0 || idx >= len(chunks) || scores[idx] <= 0 {
+	out := make([]types.SearchResult, 0, len(indices))
+	for _, i := range indices {
+		if i < 0 || i >= len(scores) || i >= len(chunks) {
 			continue
 		}
-		out = append(out, utils.SearchResult{Chunk: chunks[idx], Score: scores[idx]})
+		if scores[i] <= 0 {
+			continue
+		}
+		out = append(out, types.SearchResult{Chunk: chunks[i], Score: scores[i]})
 	}
 	return out
 }
+
+// HybridOptions configures hybridSearch.
+type HybridOptions struct {
+	Query         string
+	Embeddings    embed.EmbeddingBackend
+	SemanticIndex index.SemanticIndex
+	BM25Index     *index.BM25Index
+	Chunks        []types.Chunk
+	TopK          int
+	Alpha         *float64
+	Selector      []int
+	Rerank        *bool
+}
+
+// HybridSearch blends BM25 + semantic via RRF and optional boost/rerank.
+func HybridSearch(opts HybridOptions) ([]types.SearchResult, error) {
+	rerank := true
+	if opts.Rerank != nil {
+		rerank = *opts.Rerank
+	}
+	alphaWeight := ranking.ResolveAlpha(opts.Query, opts.Alpha)
+	candidateCount := opts.TopK * 5
+	if ranking.SearchImprovementsEnabled() && ranking.IsLocationQuery(opts.Query) {
+		candidateCount = opts.TopK * 10
+	}
+
+	chunksByKey := make(map[string]types.Chunk, len(opts.Chunks))
+	for _, c := range opts.Chunks {
+		chunksByKey[types.ChunkKey(c)] = c
+	}
+
+	type embedResult struct {
+		vec []float32
+		err error
+	}
+	embedCh := make(chan embedResult, 1)
+	go func() {
+		vec, err := opts.Embeddings.EmbedQuery(opts.Query)
+		embedCh <- embedResult{vec, err}
+	}()
+
+	bm25Hits := searchBm25(opts.Query, opts.BM25Index, opts.Chunks, candidateCount, opts.Selector)
+	er := <-embedCh
+	if er.err != nil {
+		return nil, er.err
+	}
+	semantic, err := semanticFromQueryVector(er.vec, opts.SemanticIndex, opts.Chunks, candidateCount, opts.Selector)
+	if err != nil {
+		return nil, err
+	}
+
+	semanticScores := map[string]float64{}
+	for _, r := range semantic {
+		semanticScores[types.ChunkKey(r.Chunk)] = r.Score
+	}
+	bm25Scores := map[string]float64{}
+	for _, r := range bm25Hits {
+		if r.Score != 0 {
+			bm25Scores[types.ChunkKey(r.Chunk)] = r.Score
+		}
+	}
+
+	normalizedSemantic := rrfScores(semanticScores)
+	normalizedBm25 := rrfScores(bm25Scores)
+
+	allKeys := map[string]struct{}{}
+	for k := range normalizedSemantic {
+		allKeys[k] = struct{}{}
+	}
+	for k := range normalizedBm25 {
+		allKeys[k] = struct{}{}
+	}
+	sortedKeys := make([]string, 0, len(allKeys))
+	for k := range allKeys {
+		sortedKeys = append(sortedKeys, k)
+	}
+	sort.Slice(sortedKeys, func(i, j int) bool {
+		ca, oka := chunksByKey[sortedKeys[i]]
+		cb, okb := chunksByKey[sortedKeys[j]]
+		if !oka || !okb {
+			return false
+		}
+		return ca.StartLine < cb.StartLine
+	})
+
+	combinedScores := make(map[string]float64, len(sortedKeys))
+	for _, key := range sortedKeys {
+		combinedScores[key] = alphaWeight*(normalizedSemantic[key]) + (1-alphaWeight)*(normalizedBm25[key])
+	}
+
+	if rerank {
+		ranking.BoostMultiChunkFiles(combinedScores, chunksByKey)
+		ranking.ApplyQueryBoost(combinedScores, opts.Query, opts.Chunks, chunksByKey)
+		return ranking.RerankTopk(combinedScores, chunksByKey, opts.TopK, alphaWeight < 1.0), nil
+	}
+
+	type scored struct {
+		key   string
+		score float64
+	}
+	entries := make([]scored, 0, len(combinedScores))
+	for k, s := range combinedScores {
+		entries = append(entries, scored{k, s})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].score > entries[j].score })
+	if len(entries) > opts.TopK {
+		entries = entries[:opts.TopK]
+	}
+	out := make([]types.SearchResult, 0, len(entries))
+	for _, e := range entries {
+		chunk, ok := chunksByKey[e.key]
+		if !ok {
+			continue
+		}
+		out = append(out, types.SearchResult{Chunk: chunk, Score: e.score})
+	}
+	return out, nil
+}
+
+// SemanticOnlyOptions configures searchSemanticOnly.
+type SemanticOnlyOptions struct {
+	Query         string
+	Embeddings    embed.EmbeddingBackend
+	SemanticIndex index.SemanticIndex
+	Chunks        []types.Chunk
+	TopK          int
+	Selector      []int
+}
+
+// SearchSemanticOnly embeds the query and returns nearest neighbors.
+func SearchSemanticOnly(opts SemanticOnlyOptions) ([]types.SearchResult, error) {
+	vec, err := opts.Embeddings.EmbedQuery(opts.Query)
+	if err != nil {
+		return nil, err
+	}
+	return semanticFromQueryVector(vec, opts.SemanticIndex, opts.Chunks, opts.TopK, opts.Selector)
+}
+
+// TrimQuery is a tiny helper used by callers.
+func TrimQuery(q string) string { return strings.TrimSpace(q) }

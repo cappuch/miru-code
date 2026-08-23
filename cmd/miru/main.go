@@ -1,298 +1,389 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
-	miru "github.com/takara-ai/miru-code"
+	"github.com/takara-ai/miru-code/internal/agents"
+	"github.com/takara-ai/miru-code/internal/cache"
+	"github.com/takara-ai/miru-code/internal/cliui"
 	"github.com/takara-ai/miru-code/internal/credentials"
-	"github.com/takara-ai/miru-code/internal/embeddings"
 	"github.com/takara-ai/miru-code/internal/env"
-	"github.com/takara-ai/miru-code/internal/envfiles"
+	"github.com/takara-ai/miru-code/internal/help"
 	"github.com/takara-ai/miru-code/internal/installer"
+	"github.com/takara-ai/miru-code/internal/installer/hooks"
+	"github.com/takara-ai/miru-code/internal/literal"
 	"github.com/takara-ai/miru-code/internal/mcp"
+	"github.com/takara-ai/miru-code/internal/miruindex"
+	"github.com/takara-ai/miru-code/internal/setup"
+	"github.com/takara-ai/miru-code/internal/types"
+	"github.com/takara-ai/miru-code/internal/utils"
+	"github.com/takara-ai/miru-code/internal/version"
 )
 
-var cliCommands = map[string]bool{
-	"search":       true,
-	"find-related": true,
-	"init":         true,
-	"install":      true,
-	"uninstall":    true,
-	"setup":        true,
-	"clear":        true,
-	"help":         true,
-	"-h":           true,
-	"--help":       true,
+var cliCommands = map[string]struct{}{
+	"search": {}, "locate": {}, "expand": {}, "find-related": {},
+	"init": {}, "install": {}, "uninstall": {}, "setup": {}, "clear": {},
+	"benchmark": {}, "hook-guard": {}, "help": {}, "-h": {}, "--help": {},
+	"-v": {}, "--version": {},
 }
 
 func main() {
-	envfiles.Load("", "")
-	_, _ = credentials.Load()
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	os.Args[0] = "miru"
+	env.NormalizeTakaraAPIKeyEnv()
+	_, _ = credentials.LoadStoredCredentials()
+
+	argv := os.Args[1:]
+	if len(argv) == 0 {
+		runMCP(argv)
+		return
+	}
+	first := argv[0]
+	if first == "-v" || first == "--version" {
+		fmt.Println(version.MiruVersion())
+		return
+	}
+	if first == "hook-guard" {
+		os.Exit(hooks.RunSearchGuardFromStdin(os.Stdin))
+	}
+	if _, ok := cliCommands[first]; ok {
+		if err := runCLI(argv); err != nil {
+			cliui.Fail(err.Error())
+			os.Exit(1)
+		}
+		return
+	}
+	runMCP(argv)
+}
+
+func runMCP(argv []string) {
+	var ref *string
+	benchmark := false
+	contentTokens := []string{}
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if arg == "--benchmark" {
+			benchmark = true
+			continue
+		}
+		if arg == "--ref" && i+1 < len(argv) {
+			i++
+			v := argv[i]
+			ref = &v
+			continue
+		}
+		if arg == "--content" {
+			i++
+			for i < len(argv) && !strings.HasPrefix(argv[i], "-") {
+				contentTokens = append(contentTokens, argv[i])
+				i++
+			}
+			i--
+		}
+	}
+	_, _ = credentials.LoadStoredCredentials()
+	if err := mcp.ServeMcp(mcp.ServeOptions{
+		Ref:       ref,
+		Content:   utils.ResolveContent(contentTokens),
+		Benchmark: benchmark,
+	}); err != nil {
+		cliui.Fail(err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(argv []string) error {
-	if len(argv) == 0 {
-		return runMCP(argv)
-	}
-
+func runCLI(argv []string) error {
 	command := argv[0]
 	rest := argv[1:]
-	if !cliCommands[command] {
-		return runMCP(argv)
-	}
+
 	switch command {
 	case "-h", "--help":
-		printFullHelp()
+		help.PrintFullHelp()
+		return nil
+	case "-v", "--version":
+		fmt.Println(version.MiruVersion())
 		return nil
 	case "help":
 		if len(rest) == 0 {
-			printMainHelp()
+			help.PrintMainHelp()
 			return nil
 		}
-		return printCommandHelp(rest[0])
-	case "clear":
-		target := "."
-		if len(rest) > 0 {
-			target = rest[0]
-		}
-		abs, err := filepath.Abs(target)
-		if err != nil {
-			return err
-		}
-		if err := miru.ClearCache(abs); err != nil {
-			return err
-		}
-		fmt.Printf("Cleared cached index for %s\n", abs)
+		help.PrintCommandHelp(rest[0])
 		return nil
-	case "search":
-		return runSearch(rest)
-	case "find-related":
-		return runFindRelated(rest)
-	case "setup":
-		return runSetup(rest)
+	case "hook-guard":
+		os.Exit(hooks.RunSearchGuardFromStdin(os.Stdin))
+	case "install", "uninstall":
+		opts := installer.RunInstallerOptions{}
+		mode := installer.ModeInstall
+		if command == "uninstall" {
+			mode = installer.ModeUninstall
+		}
+		filtered := make([]string, 0, len(rest))
+		for i := 0; i < len(rest); i++ {
+			switch rest[i] {
+			case "--yes", "-y":
+				opts.Yes = true
+			case "--all":
+				opts.AllAgents = true
+			case "--agent":
+				if i+1 < len(rest) {
+					i++
+					opts.AgentIDs = append(opts.AgentIDs, rest[i])
+				}
+			default:
+				filtered = append(filtered, rest[i])
+			}
+		}
+		_ = filtered
+		return installer.RunInstaller(mode, opts)
+	case "benchmark":
+		return runBenchmark(rest)
 	case "init":
 		return runInit(rest)
-	case "install":
-		return runInstaller(installer.Install)
-	case "uninstall":
-		return runInstaller(installer.Uninstall)
-	default:
-		printMainHelp()
-		return fmt.Errorf("unknown command: %s", command)
-	}
-}
-
-func runInstaller(mode installer.Mode) error {
-	if mode == installer.Install {
-		if _, err := env.ResolveEmbeddingAPIKey(); err != nil {
+	case "setup":
+		return runSetup(rest)
+	case "clear":
+		path := utils.ResolveSearchPath(".")
+		if len(rest) > 0 {
+			path = utils.ResolveSearchPath(rest[0])
+		}
+		if err := cache.ClearCache(path); err != nil {
 			return err
 		}
+		cliui.Success("Cleared cached index for " + path)
+		return nil
 	}
-	results, err := installer.Run(mode)
-	if err != nil {
-		return err
-	}
-	fmt.Print(installer.FormatResults(results))
-	if mode == installer.Install {
-		fmt.Fprintln(os.Stderr, "Restart your agents to pick up changes.")
+
+	jsonFlag, jsonRest := parseFlag(rest, "--json")
+	content, contentRest := parseContent(jsonRest)
+	topK, sizedRest := parseTopK(contentRest)
+
+	switch command {
+	case "search":
+		if len(sizedRest) == 0 {
+			help.PrintCommandHelp("search")
+			os.Exit(1)
+		}
+		query := sizedRest[0]
+		path := utils.ResolveSearchPath(".")
+		if len(sizedRest) > 1 {
+			path = utils.ResolveSearchPath(sizedRest[1])
+		}
+		return runSearch(path, query, topK, content, jsonFlag)
+	case "locate":
+		if len(sizedRest) == 0 {
+			help.PrintCommandHelp("locate")
+			os.Exit(1)
+		}
+		return runLocate(sizedRest, content, jsonFlag)
+	case "expand":
+		return runExpand(sizedRest, content, jsonFlag)
+	case "find-related":
+		return runFindRelated(sizedRest, content, topK, jsonFlag)
+	default:
+		cliui.Fail("Unknown command: " + command)
+		help.PrintMainHelp()
+		os.Exit(1)
 	}
 	return nil
 }
 
-func runMCP(argv []string) error {
-	var ref *string
-	contentTokens := []string{}
-	for i := 0; i < len(argv); i++ {
-		switch argv[i] {
-		case "--ref":
-			i++
-			if i < len(argv) {
-				value := argv[i]
-				ref = &value
-			}
-		case "--content":
-			i++
-			for i < len(argv) {
-				value := argv[i]
-				if strings.HasPrefix(value, "-") {
-					i--
-					break
-				}
-				contentTokens = append(contentTokens, value)
-				i++
-			}
-		}
+func runSetup(rest []string) error {
+	args, errCode := setup.ParseSetupCLIArgs(rest)
+	switch errCode {
+	case setup.ErrClearWithKey:
+		cliui.Fail("miru setup --clear cannot be combined with --key, --device, or --sagemaker.")
+		os.Exit(1)
+	case setup.ErrSageMakerWithKey:
+		cliui.Fail("miru setup --sagemaker cannot be combined with --key.")
+		os.Exit(1)
+	case setup.ErrDeviceWithKey:
+		cliui.Fail("miru setup accepts either --device or --key TOKEN, not both.")
+		os.Exit(1)
+	case setup.ErrDeviceWithSageMaker:
+		cliui.Fail("miru setup --device cannot be combined with --sagemaker.")
+		os.Exit(1)
 	}
-	if len(contentTokens) == 0 {
-		contentTokens = []string{"code"}
+	if args.Clear {
+		return setup.RunClearCredentials()
 	}
-	if _, err := env.ResolveEmbeddingAPIKey(); err != nil {
+	result, err := setup.RunSetup(setup.RunSetupOptions{
+		APIKey:       args.APIKey,
+		Device:       args.Device,
+		Force:        args.Force,
+		SageMaker:    args.SageMaker,
+		SageMakerARN: args.SageMakerARN,
+		Profile:      args.Profile,
+	})
+	if err != nil {
 		return err
 	}
-	return mcp.Serve(ref, miru.ResolveContent(contentTokens))
+	if result.NewlySaved {
+		if setup.CanPromptForCredentials() && args.APIKey == "" && !args.Device && !args.Force {
+			if installer.PromptConfirm("Configure Miru in your coding agent now?", true) {
+				return installer.RunInstaller(installer.ModeInstall, installer.RunInstallerOptions{})
+			}
+		}
+		cliui.Hint("Run `miru install` to add Miru to your IDE.")
+	}
+	return nil
 }
 
-func runInit(argv []string) error {
-	var agent miru.AgentID
+func runInit(rest []string) error {
+	var agent string
 	force := false
-	for i := 0; i < len(argv); i++ {
-		switch argv[i] {
-		case "--force":
+	for i := 0; i < len(rest); i++ {
+		arg := rest[i]
+		if arg == "--force" {
 			force = true
-		case "--agent", "-a":
+			continue
+		}
+		if (arg == "--agent" || arg == "-a") && i+1 < len(rest) {
 			i++
-			if i < len(argv) {
-				agent = miru.AgentID(argv[i])
-			}
+			agent = rest[i]
 		}
 	}
 	if agent == "" {
-		_ = printCommandHelp("init")
-		return fmt.Errorf("miru init requires --agent")
+		cliui.Fail("miru init requires --agent.")
+		help.PrintCommandHelp("init")
+		os.Exit(1)
 	}
-	dest, err := miru.WriteAgentFile(agent, force)
+	if !agents.IsValidAgentID(agent) {
+		cliui.Fail(help.FormatUnknownAgent(agent))
+		os.Exit(1)
+	}
+	dest, err := agents.WriteAgentFile(agents.AgentID(agent), force)
 	if err != nil {
-		return err
+		cliui.Fail(err.Error())
+		cliui.Hint("Use --force to overwrite an existing file.")
+		os.Exit(1)
 	}
-	fmt.Printf("Wrote sub-agent: %s\n", dest)
+	cliui.Success("Wrote sub-agent: " + dest)
 	return nil
 }
 
-func runSetup(argv []string) error {
-	apiKey := ""
-	force := false
-	clear := false
-	for i := 0; i < len(argv); i++ {
-		switch argv[i] {
-		case "--force":
-			force = true
-		case "--clear":
-			clear = true
-		case "--key", "-k":
+func runBenchmark(rest []string) error {
+	if len(rest) == 0 || rest[0] == "-h" || rest[0] == "--help" {
+		help.PrintCommandHelp("benchmark")
+		return nil
+	}
+	action := rest[0]
+	switch action {
+	case "status", "on", "off", "clear":
+		cliui.Info("Benchmark mode toggling is simplified in the Go port.")
+		cliui.Hint("Pass --benchmark when launching MCP, or reinstall agent configs with that flag preserved.")
+		return nil
+	default:
+		cliui.Fail(fmt.Sprintf("Unknown benchmark action %q. Use on, off, status, or clear.", action))
+		help.PrintCommandHelp("benchmark")
+		os.Exit(1)
+	}
+	return nil
+}
+
+func runSearch(path, query string, topK int, content []types.ContentType, jsonFlag bool) error {
+	if err := setup.EnsureCredentials(true); err != nil {
+		return err
+	}
+	cliui.Info("Indexing and searching…")
+	idx, err := miruindex.FromSource(path, content, nil, nil)
+	if err != nil {
+		return err
+	}
+	_ = idx.SaveToCache(path, false)
+	results, err := idx.Search(miruindex.SearchOptions{Query: query, TopK: topK})
+	if err != nil {
+		return err
+	}
+	emitSearchOutput(query, results, jsonFlag, "No results found.")
+	return nil
+}
+
+func runExpand(sizedRest []string, content []types.ContentType, jsonFlag bool) error {
+	if len(sizedRest) < 2 {
+		help.PrintCommandHelp("expand")
+		os.Exit(1)
+	}
+	filePath := sizedRest[0]
+	line, err := strconv.Atoi(sizedRest[1])
+	if err != nil {
+		return fmt.Errorf("invalid line number")
+	}
+	path := utils.ResolveSearchPath(".")
+	before := utils.DefaultExpandBefore
+	after := utils.DefaultExpandAfter
+	for i := 2; i < len(sizedRest); i++ {
+		arg := sizedRest[i]
+		if arg == "--before" && i+1 < len(sizedRest) {
 			i++
-			if i < len(argv) {
-				apiKey = argv[i]
-			}
+			before, _ = strconv.Atoi(sizedRest[i])
+			continue
+		}
+		if arg == "--after" && i+1 < len(sizedRest) {
+			i++
+			after, _ = strconv.Atoi(sizedRest[i])
+			continue
+		}
+		if !strings.HasPrefix(arg, "-") {
+			path = utils.ResolveSearchPath(arg)
 		}
 	}
-	if clear {
-		if apiKey != "" {
-			return fmt.Errorf("miru setup --clear cannot be combined with --key")
-		}
-		result, err := credentials.Clear()
-		if err != nil {
-			return err
-		}
-		if result.Cleared {
-			fmt.Fprintf(os.Stderr, "Removed stored API key from %s\n", result.Path)
-		} else {
-			fmt.Fprintf(os.Stderr, "No stored API key at %s\n", result.Path)
-		}
-		return nil
+	if err := setup.EnsureCredentials(true); err != nil {
+		return err
 	}
-	if !force && env.HasTakaraAPIKeyInEnv() {
-		if stored, _ := credentials.Read(); stored != nil {
-			fmt.Fprintf(os.Stderr, "API key already configured (env + %s). Use --force to replace stored key.\n", credentials.ResolvePath())
-			return nil
-		}
-		fmt.Fprintln(os.Stderr, "API key already set via environment variable. Stored credentials unchanged.")
-		return nil
-	}
-	if !force {
-		if stored, _ := credentials.Read(); stored != nil && apiKey == "" {
-			os.Setenv(env.TakaraAPIKeyEnv, stored.TakaraAPIKey)
-			fmt.Fprintf(os.Stderr, "API key already stored at %s. Use --force to replace.\n", credentials.ResolvePath())
-			return nil
-		}
-	}
-	if apiKey == "" {
-		fmt.Fprint(os.Stderr, "Takara API key: ")
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		if err != nil {
-			return err
-		}
-		apiKey = strings.TrimSpace(line)
-	}
-	if apiKey == "" {
-		return fmt.Errorf("API key cannot be empty")
-	}
-	result := embeddings.ValidateAPIKey(apiKey, "", "", nil)
-	if !result.Valid {
-		return fmt.Errorf("%s", result.Message)
-	}
-	path, err := credentials.Save(apiKey)
+	cliui.Info("Expanding chunks…")
+	idx, err := miruindex.FromSource(path, content, nil, nil)
 	if err != nil {
 		return err
 	}
-	os.Setenv(env.TakaraAPIKeyEnv, apiKey)
-	fmt.Fprintf(os.Stderr, "Saved credentials to %s\n", path)
+	repoRoot := utils.LocalRepoRoot(path)
+	anchor, expanded := utils.ExpandChunksAtLine(idx.Chunks(), filePath, line, repoRoot, before, after)
+	_ = idx.SaveToCache(path, false)
+	if anchor == nil {
+		cliui.Fail(fmt.Sprintf("No chunk found at %s:%d.", filePath, line))
+		os.Exit(1)
+	}
+	payload := utils.FormatExpandResults(filePath, line, anchor, expanded, &utils.FormatExpandOptions{
+		RepoRoot: repoRoot, Before: &before, After: &after,
+	})
+	if cliui.PrefersJSONOutput(jsonFlag) {
+		enc := json.NewEncoder(os.Stdout)
+		return enc.Encode(payload)
+	}
+	for _, chunk := range payload.Chunks {
+		fmt.Printf("\n%v\n", chunk["location"])
+		fmt.Printf("%v\n", chunk["content"])
+	}
+	fmt.Println()
 	return nil
 }
 
-func runSearch(argv []string) error {
-	jsonFlag, rest := parseFlag(argv, "--json")
-	content, rest := parseContent(rest)
-	topK, rest := parseTopK(rest)
-	if len(rest) == 0 {
-		return printCommandHelp("search")
+func runFindRelated(sizedRest []string, content []types.ContentType, topK int, jsonFlag bool) error {
+	if len(sizedRest) < 2 {
+		help.PrintCommandHelp("find-related")
+		os.Exit(1)
 	}
-	query := rest[0]
-	path := "."
-	if len(rest) > 1 {
-		path = rest[1]
+	filePath := sizedRest[0]
+	line, err := strconv.Atoi(sizedRest[1])
+	if err != nil {
+		return fmt.Errorf("invalid line number")
 	}
-	idx, err := miru.FromSource(path, content)
+	path := utils.ResolveSearchPath(".")
+	if len(sizedRest) > 2 {
+		path = utils.ResolveSearchPath(sizedRest[2])
+	}
+	if err := setup.EnsureCredentials(true); err != nil {
+		return err
+	}
+	cliui.Info("Finding related chunks…")
+	idx, err := miruindex.FromSource(path, content, nil, nil)
 	if err != nil {
 		return err
 	}
-	if err := idx.SaveToDefaultCache(path); err != nil {
-		return err
-	}
-	results, err := idx.Search(query, topK, nil, nil, nil, nil)
-	if err != nil {
-		return err
-	}
-	if jsonFlag {
-		return json.NewEncoder(os.Stdout).Encode(miru.FormatResults(query, results))
-	}
-	printSearchResults(query, results)
-	return nil
-}
-
-func runFindRelated(argv []string) error {
-	jsonFlag, rest := parseFlag(argv, "--json")
-	content, rest := parseContent(rest)
-	topK, rest := parseTopK(rest)
-	if len(rest) < 2 {
-		return printCommandHelp("find-related")
-	}
-	filePath := rest[0]
-	line, err := strconv.Atoi(rest[1])
-	if err != nil {
-		return fmt.Errorf("invalid line: %s", rest[1])
-	}
-	path := "."
-	if len(rest) > 2 {
-		path = rest[2]
-	}
-	idx, err := miru.FromSource(path, content)
-	if err != nil {
-		return err
-	}
-	if err := idx.SaveToDefaultCache(path); err != nil {
-		return err
-	}
-	chunk := miru.ResolveChunk(idx.Chunks(), filePath, line)
+	chunk := utils.ResolveChunk(idx.Chunks(), filePath, line, utils.LocalRepoRoot(path))
 	if chunk == nil {
 		return fmt.Errorf("No chunk found at %s:%d.", filePath, line)
 	}
@@ -300,151 +391,157 @@ func runFindRelated(argv []string) error {
 	if err != nil {
 		return err
 	}
-	label := fmt.Sprintf("%s:%d", filePath, line)
-	if jsonFlag {
-		return json.NewEncoder(os.Stdout).Encode(miru.FormatResults(label, results))
-	}
-	printSearchResults(label, results)
+	_ = idx.SaveToCache(path, false)
+	emitSearchOutput(cliui.FormatRelatedHeader(filePath, line), results, jsonFlag, fmt.Sprintf("No related chunks found for %s:%d.", filePath, line))
 	return nil
 }
 
+func runLocate(sizedRest []string, content []types.ContentType, jsonFlag bool) error {
+	lit := sizedRest[0]
+	opts := literal.LocateOptions{}
+	var include, exclude []string
+	pathArgs := []string{}
+	for i := 1; i < len(sizedRest); i++ {
+		arg := sizedRest[i]
+		switch {
+		case arg == "--mode" && i+1 < len(sizedRest):
+			i++
+			opts.Mode = literal.Mode(sizedRest[i])
+		case arg == "--limit" && i+1 < len(sizedRest):
+			i++
+			n, _ := strconv.Atoi(sizedRest[i])
+			opts.Limit = &n
+		case arg == "--ignore-case":
+			opts.IgnoreCase = true
+		case arg == "--match-variants":
+			opts.MatchVariants = true
+		case arg == "--include" && i+1 < len(sizedRest):
+			i++
+			include = append(include, sizedRest[i])
+		case arg == "--exclude" && i+1 < len(sizedRest):
+			i++
+			exclude = append(exclude, sizedRest[i])
+		case arg == "--context" && i+1 < len(sizedRest):
+			i++
+			n, _ := strconv.Atoi(sizedRest[i])
+			opts.ContextLines = &n
+		default:
+			if !strings.HasPrefix(arg, "-") {
+				pathArgs = append(pathArgs, arg)
+			}
+		}
+	}
+	opts.Include = include
+	opts.Exclude = exclude
+	path := utils.ResolveSearchPath(".")
+	if len(pathArgs) > 0 {
+		path = utils.ResolveSearchPath(pathArgs[0])
+	}
+	if err := setup.EnsureCredentials(true); err != nil {
+		return err
+	}
+	cliui.Info("Locating literal…")
+	idx, err := miruindex.FromSource(path, content, nil, nil)
+	if err != nil {
+		return err
+	}
+	_ = idx.SaveToCache(path, false)
+	result := idx.LocateLiteral(lit, opts)
+	payload := literal.FormatLocate(result)
+	if cliui.PrefersJSONOutput(jsonFlag) {
+		enc := json.NewEncoder(os.Stdout)
+		return enc.Encode(payload)
+	}
+	mode := opts.Mode
+	if mode == "" {
+		mode = literal.DefaultMode
+	}
+	fmt.Printf("literal=%s  n=%v  files=%v  mode=%s\n", lit, payload["n"], payload["files"], mode)
+	if hits, ok := payload["hits"].([]map[string]any); ok {
+		for _, hit := range hits {
+			if ctx, ok := hit["ctx"].([]string); ok {
+				fmt.Printf("  %v:%v:\n", hit["f"], hit["l"])
+				start := 0
+				if v, ok := hit["ctx_l"].(*int); ok && v != nil {
+					start = *v
+				} else if v, ok := hit["ctx_l"].(int); ok {
+					start = v
+				}
+				for i, line := range ctx {
+					fmt.Printf("    %d: %s\n", start+i, line)
+				}
+			} else if t, ok := hit["t"]; ok {
+				fmt.Printf("  %v:%v: %v\n", hit["f"], hit["l"], t)
+			} else {
+				fmt.Printf("  %v:%v\n", hit["f"], hit["l"])
+			}
+		}
+	}
+	fmt.Println()
+	return nil
+}
+
+func emitSearchOutput(query string, results []types.SearchResult, jsonFlag bool, emptyMessage string) {
+	if len(results) == 0 {
+		if cliui.PrefersJSONOutput(jsonFlag) {
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]string{"error": emptyMessage})
+			return
+		}
+		fmt.Print(cliui.FormatSearchErrorPretty(emptyMessage))
+		return
+	}
+	if cliui.PrefersJSONOutput(jsonFlag) {
+		_ = json.NewEncoder(os.Stdout).Encode(utils.FormatResults(query, results, nil))
+		return
+	}
+	fmt.Print(cliui.FormatSearchResultsPretty(query, results))
+}
+
 func parseFlag(argv []string, flag string) (bool, []string) {
-	out := []string{}
+	rest := make([]string, 0, len(argv))
 	present := false
 	for _, arg := range argv {
 		if arg == flag {
 			present = true
 			continue
 		}
-		out = append(out, arg)
+		rest = append(rest, arg)
 	}
-	return present, out
+	return present, rest
 }
 
-func parseContent(argv []string) ([]miru.ContentType, []string) {
-	contentTokens := []string{}
-	rest := []string{}
+func parseContent(argv []string) ([]types.ContentType, []string) {
+	rest := make([]string, 0, len(argv))
+	content := []string{}
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
 		if arg == "--content" {
 			i++
-			for i < len(argv) {
-				value := argv[i]
-				if len(value) > 0 && value[0] == '-' {
-					i--
-					break
-				}
-				contentTokens = append(contentTokens, value)
+			for i < len(argv) && !strings.HasPrefix(argv[i], "-") {
+				content = append(content, argv[i])
 				i++
 			}
+			i--
 			continue
 		}
 		rest = append(rest, arg)
 	}
-	if len(contentTokens) == 0 {
-		contentTokens = []string{"code"}
-	}
-	return miru.ResolveContent(contentTokens), rest
+	return utils.ResolveContent(content), rest
 }
 
 func parseTopK(argv []string) (int, []string) {
-	rest := []string{}
+	rest := make([]string, 0, len(argv))
 	topK := 5
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
-		if arg == "-k" || arg == "--top-k" {
+		if (arg == "-k" || arg == "--top-k") && i+1 < len(argv) {
 			i++
-			if i < len(argv) {
-				if value, err := strconv.Atoi(argv[i]); err == nil && value >= 1 {
-					topK = value
-				}
+			if n, err := strconv.Atoi(argv[i]); err == nil && n >= 1 {
+				topK = n
 			}
 			continue
 		}
 		rest = append(rest, arg)
 	}
 	return topK, rest
-}
-
-func printSearchResults(query string, results []miru.SearchResult) {
-	if len(results) == 0 {
-		fmt.Println("No results found.")
-		return
-	}
-	fmt.Printf("Results for %q\n\n", query)
-	for i, result := range results {
-		fmt.Printf("%d. %s:%d-%d  %.3f\n", i+1, result.Chunk.FilePath, result.Chunk.StartLine, result.Chunk.EndLine, result.Score)
-		fmt.Println(result.Chunk.Content)
-		fmt.Println()
-	}
-}
-
-func printMainHelp() {
-	fmt.Println("miru")
-	fmt.Println("hybrid code search for agents")
-	fmt.Println()
-	fmt.Println("Usage")
-	fmt.Println("  miru                         Start MCP server (stdio)")
-	fmt.Println("  miru <command> [options]")
-	fmt.Println()
-	fmt.Println("Commands")
-	fmt.Println("  search          Hybrid search over a codebase")
-	fmt.Println("  find-related    Find chunks related to a file:line")
-	fmt.Println("  setup           Save your Takara API key locally")
-	fmt.Println("  install         Configure miru across coding agents")
-	fmt.Println("  uninstall       Remove miru agent configuration")
-	fmt.Println("  init            Write a project-local sub-agent file")
-	fmt.Println("  clear           Remove cached index for a path")
-	fmt.Println("  help            Show help for a command")
-}
-
-func printFullHelp() {
-	printMainHelp()
-	fmt.Println()
-	fmt.Println("Environment")
-	fmt.Println("  TAKARA_API_KEY")
-	fmt.Println("      Takara bearer token for embeddings")
-	fmt.Println("  MIRU_OPENAI_BASE_URL")
-	fmt.Println("      Default: https://infer.dev.takara.ai/v1")
-	fmt.Println("  MIRU_CONCURRENCY")
-	fmt.Println("      Parallel workers (default: CPUs - 2)")
-}
-
-func printCommandHelp(command string) error {
-	switch command {
-	case "search":
-		fmt.Println("miru search")
-		fmt.Println("Hybrid semantic + keyword search.")
-		fmt.Println("Usage: miru search <query> [path] [options]")
-		fmt.Println("Options: -k, --top-k N; --content TYPE; --json")
-	case "find-related":
-		fmt.Println("miru find-related")
-		fmt.Println("Semantic neighbors of a file location.")
-		fmt.Println("Usage: miru find-related <file> <line> [path] [options]")
-	case "setup":
-		fmt.Println("miru setup")
-		fmt.Println("Store and validate your Takara API key.")
-		fmt.Println("Usage: miru setup [--key TOKEN] [--force] [--clear]")
-	case "install":
-		fmt.Println("miru install")
-		fmt.Println("Interactive global agent setup.")
-	case "uninstall":
-		fmt.Println("miru uninstall")
-		fmt.Println("Remove miru configuration from agents.")
-	case "init":
-		fmt.Println("miru init")
-		fmt.Println("Project-local sub-agent file.")
-		fmt.Println("Usage: miru init --agent AGENT [--force]")
-	case "clear":
-		fmt.Println("miru clear")
-		fmt.Println("Drop the on-disk index cache.")
-		fmt.Println("Usage: miru clear [path]")
-	case "mcp":
-		fmt.Println("miru mcp")
-		fmt.Println("Stdio MCP server (default with no subcommand).")
-	default:
-		printMainHelp()
-		return fmt.Errorf("unknown command: %s", command)
-	}
-	return nil
 }
