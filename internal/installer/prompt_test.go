@@ -30,3 +30,25 @@ func TestParseInstallerKeyArrows(t *testing.T) {
 		}
 	}
 }
+
+func TestNextConfirmYesSelected(t *testing.T) {
+	cases := []struct {
+		yesSelected bool
+		key         string
+		want        bool
+	}{
+		{false, "left", true},
+		{false, "yes", true},
+		{true, "right", false},
+		{true, "no", false},
+		{true, "left", true},
+		{false, "right", false},
+		{true, "enter", true},
+	}
+	for _, tc := range cases {
+		got := nextConfirmYesSelected(tc.yesSelected, tc.key)
+		if got != tc.want {
+			t.Errorf("nextConfirmYesSelected(%v, %q)=%v want %v", tc.yesSelected, tc.key, got, tc.want)
+		}
+	}
+}

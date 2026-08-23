@@ -75,18 +75,26 @@ func PromptConfirm(question string, defaultYes bool) bool {
 		case "enter":
 			fmt.Fprint(os.Stderr, "\r\n")
 			return yesSelected
-		case "left", "no":
-			if yesSelected {
-				yesSelected = false
-				rewriteConfirm(question, yesSelected)
-			}
-		case "right", "yes":
-			if !yesSelected {
-				yesSelected = true
+		case "left", "right", "yes", "no":
+			next := nextConfirmYesSelected(yesSelected, key)
+			if next != yesSelected {
+				yesSelected = next
 				rewriteConfirm(question, yesSelected)
 			}
 		}
 	}
+}
+
+// nextConfirmYesSelected maps confirm keys to the next Yes selection.
+// Left/← and y → Yes; right/→ and n → No (matches on-screen Yes | No order).
+func nextConfirmYesSelected(yesSelected bool, key string) bool {
+	if key == "left" || key == "yes" {
+		return true
+	}
+	if key == "right" || key == "no" {
+		return false
+	}
+	return yesSelected
 }
 
 func writeConfirm(question string, yesSelected bool) {
