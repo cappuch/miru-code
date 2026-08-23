@@ -281,12 +281,10 @@ func RunSetup(opts RunSetupOptions) (RunSetupResult, error) {
 	}
 
 	cliui.WriteStderr("")
+	// stderr: setup/MCP must not write human auth UI to stdout (JSON-RPC / piped CLI).
 	cliui.PrintBrandBanner(os.Stderr)
 	cliui.Divider("─", 48, os.Stderr)
-	cliui.WriteStdout("Miru needs Takara credentials for code embeddings.")
-	cliui.Hint("Device code login is the default. Manual API key entry is still available.")
-	cliui.Hint("This replaces any stored SageMaker endpoint — only one embedding mode is active at a time.")
-	cliui.WriteStdout("")
+	cliui.WriteStderr("")
 
 	_ = credentials.BeginModeSwitch("takara")
 	hadSageMaker := false
@@ -313,14 +311,12 @@ func RunSetup(opts RunSetupOptions) (RunSetupResult, error) {
 		token = creds.AccessToken
 	}
 	credentials.SetStoredCredentialsEnvToken(token)
-	cliui.WriteStdout("")
-	cliui.Success("Saved credentials to " + path)
+	cliui.WriteStderr("")
+	cliui.Hint("Congratulations! You are now signed in.")
 	if hadSageMaker {
 		cliui.Hint("Removed the stored SageMaker endpoint — Miru now embeds only via Takara.")
-	} else {
-		cliui.Hint("MCP loads this key from credentials.json automatically.")
 	}
-	cliui.WriteStdout("")
+	cliui.WriteStderr("")
 	return RunSetupResult{Path: path, NewlySaved: true}, nil
 }
 

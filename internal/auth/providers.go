@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/takara-ai/miru-code/internal/cliui"
+	"github.com/takara-ai/miru-code/internal/spinner"
 )
 
 // AuthenticateOptions configures interactive / non-interactive auth.
@@ -34,19 +35,11 @@ func resolveAuthMode(opts AuthenticateOptions) (StoredCredentialKind, error) {
 	if opts.APIKey != "" {
 		return KindAPIKey, nil
 	}
-	if opts.Device {
+	// Interactive setup defaults to device code — API keys stay behind --key.
+	if opts.Device || opts.Interactive {
 		return KindDeviceCode, nil
 	}
-	if !opts.Interactive {
-		return "", fmt.Errorf("Choose an auth mode with `miru setup --device` or `miru setup --key TOKEN`.")
-	}
-	cliui.WriteStderr("")
-	cliui.Info("Choose how to authenticate.")
-	useDevice := promptConfirm("Use device code login?", true)
-	if useDevice {
-		return KindDeviceCode, nil
-	}
-	return KindAPIKey, nil
+	return "", fmt.Errorf("Choose an auth mode with `miru setup --device` or `miru setup --key TOKEN`.")
 }
 
 func promptConfirm(question string, defaultYes bool) bool {
@@ -68,7 +61,7 @@ func promptConfirm(question string, defaultYes bool) bool {
 
 func promptAPIKey() (string, error) {
 	for {
-		fmt.Fprint(os.Stderr, "Takara API key: ")
+		fmt.Fprint(os.Stderr, "Takara API key (input hidden): ")
 		scanner := bufio.NewScanner(os.Stdin)
 		if !scanner.Scan() {
 			return "", fmt.Errorf("API key cannot be empty.")
@@ -97,31 +90,12 @@ func authenticateWithAPIKey(opts AuthenticateOptions) (AuthenticatedCredentials,
 }
 
 func authenticateWithDeviceCode(opts AuthenticateOptions) (AuthenticatedCredentials, error) {
+	cliui.WriteStderr("")
+	spin := spinner.New("Authenticating")
+	spin.Start()
 	start, err := StartDeviceAuthorization(nil, nil)
 	if err != nil {
-		return AuthenticatedCredentials{}, err
-	}
-	cliui.WriteStderr("")
-	cliui.Info(fmt.Sprintf("Open %s", start.VerificationURI))
-	cliui.Hint(fmt.Sprintf("Code: %s", start.UserCode))
-	if start.VerificationURIComplete != "" {
-		cliui.Hint(fmt.Sprintf("Direct link: %s", start.VerificationURIComplete))
-	}
-	if opts.Interactive {
-		openBrowser := os.Getenv("MIRU_OPEN_BROWSER")
-		if openBrowser == "" || openBrowser == "1" {
-			link := start.VerificationURI
-			if start.VerificationURIComplete != "" {
-				link = start.VerificationURIComplete
-			}
-			if OpenBrowserForDeviceLogin(link) {
-				cliui.Hint("Opened the verification page in your browser.")
-			}
-		}
-	}
-	cliui.Info("Waiting for device authorization…")
-	tokens, err := PollDeviceAuthorization(start, nil, nil)
-	if err != nil {
+		spin.Stop("")
 		if opts.AllowManualFallback && opts.Interactive {
 			cliui.Warn(err.Error())
 			if promptConfirm("Enter an API key instead?", true) {
@@ -130,7 +104,36 @@ func authenticateWithDeviceCode(opts AuthenticateOptions) (AuthenticatedCredenti
 		}
 		return AuthenticatedCredentials{}, err
 	}
-	cliui.Success("Device login completed")
+
+	verificationURL := start.VerificationURI
+	if start.VerificationURIComplete != "" {
+		verificationURL = start.VerificationURIComplete
+	}
+
+	shouldOpenBrowser := opts.Interactive &&
+		(os.Getenv("MIRU_OPEN_BROWSER") == "" || os.Getenv("MIRU_OPEN_BROWSER") == "1")
+	if shouldOpenBrowser {
+		_ = OpenBrowserForDeviceLogin(verificationURL)
+	}
+
+	visit := cliui.Dim("  Visit " + verificationURL)
+	if start.VerificationURIComplete == "" {
+		visit += "\n" + cliui.Dim("  Code: "+start.UserCode)
+	}
+	spin.Follow(visit)
+
+	tokens, err := PollDeviceAuthorization(start, nil, nil)
+	if err != nil {
+		spin.Stop("")
+		if opts.AllowManualFallback && opts.Interactive {
+			cliui.Warn(err.Error())
+			if promptConfirm("Enter an API key instead?", true) {
+				return authenticateWithAPIKey(opts)
+			}
+		}
+		return AuthenticatedCredentials{}, err
+	}
+	spin.Succeed("")
 	return AuthenticatedCredentials{
 		Kind:         KindDeviceCode,
 		AccessToken:  tokens.AccessToken,
