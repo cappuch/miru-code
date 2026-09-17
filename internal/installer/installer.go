@@ -2,6 +2,7 @@ package installer
 
 import (
 	"embed"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -651,6 +652,17 @@ func RunInstaller(mode InstallMode, opts RunInstallerOptions) error {
 	}
 	cliui.WriteStdout(cliui.BrandTitle() + title)
 	cliui.Divider("", 0, os.Stdout)
+	if install {
+		profile, err := installShellPath()
+		if err != nil {
+			return err
+		}
+		if profile != "" {
+			cliui.WriteStdout(" Installed executable: " + installedExecutable)
+			cliui.WriteStdout(" PATH configured in " + profile)
+			cliui.Hint("If miru is not found in this terminal, run: export PATH=\"$HOME/.local/bin:$PATH\"")
+		}
+	}
 
 	targets := AgentTargets()
 	selectedIDs := opts.AgentIDs
@@ -763,6 +775,7 @@ func RunInstaller(mode InstallMode, opts RunInstallerOptions) error {
 		SteSeenPaths:     map[string]struct{}{},
 	}
 
+	failures := 0
 	for _, agent := range chosenAgents {
 		cliui.WriteStdout(" " + agent.DisplayName)
 		for _, integ := range chosenInts {
@@ -771,11 +784,15 @@ func RunInstaller(mode InstallMode, opts RunInstallerOptions) error {
 			}
 			result, err := integ.Apply(agent, mode, applyCtx)
 			if err != nil {
+				failures++
 				cliui.WriteStdout("   ✗ " + integ.Label + " error: " + err.Error())
 				continue
 			}
 			if result == nil {
 				continue
+			}
+			if result.Action == ActionError {
+				failures++
 			}
 			line := "   · " + integ.Label + " " + string(result.Action)
 			if result.Note != "" {
@@ -786,6 +803,9 @@ func RunInstaller(mode InstallMode, opts RunInstallerOptions) error {
 		}
 	}
 	cliui.WriteStdout("")
+	if failures > 0 {
+		return fmt.Errorf("%d integration(s) failed; successful changes were kept (see errors above)", failures)
+	}
 	if install {
 		cliui.Success("Done. Restart agents to apply changes.")
 	} else {

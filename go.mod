@@ -7,6 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.36
 	github.com/aws/aws-sdk-go-v2/service/sagemakerruntime v1.44.0
 	github.com/smacker/go-tree-sitter v0.0.0-20240827094217-dd81d9e9be82
+	github.com/tailscale/hujson v0.0.0-20221223112325-20486734a56a
 	golang.org/x/term v0.45.0
 	golang.org/x/text v0.21.0
 )

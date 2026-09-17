@@ -83,6 +83,9 @@ type AgentTarget struct {
 // ResolveMiruExecutable returns the absolute path to the miru binary.
 // NEVER returns bunx — agent MCP configs must invoke the Go binary directly.
 func ResolveMiruExecutable() (string, error) {
+	if installedExecutable != "" {
+		return installedExecutable, nil
+	}
 	if exe, err := os.Executable(); err == nil {
 		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 			return resolved, nil
@@ -94,6 +97,9 @@ func ResolveMiruExecutable() (string, error) {
 	}
 	return "", os.ErrNotExist
 }
+
+// Set by install after copying the executable to its permanent location.
+var installedExecutable string
 
 // StdioServerConfig builds a stdio MCP entry pointing at the Go miru binary.
 func StdioServerConfig(withType bool) map[string]any {
@@ -252,48 +258,48 @@ func AgentTargets() []AgentTarget {
 	return []AgentTarget{
 		{
 			ID: "claude", DisplayName: "Claude Code", Binary: "claude",
-			ConfigDir: filepath.Join(h, ".claude"),
-			MCP: jsonMcp(filepath.Join(h, ".claude.json"), "mcpServers", StdioServerConfig(true)),
+			ConfigDir:        filepath.Join(h, ".claude"),
+			MCP:              jsonMcp(filepath.Join(h, ".claude.json"), "mcpServers", StdioServerConfig(true)),
 			InstructionsPath: filepath.Join(h, ".claude", "CLAUDE.md"),
-			HooksPath: filepath.Join(h, ".claude", "settings.json"), HooksFormat: "claude",
+			HooksPath:        filepath.Join(h, ".claude", "settings.json"), HooksFormat: "claude",
 			SubagentPath: filepath.Join(h, ".claude", "agents", "miru-code.md"), SubagentID: "claude",
 			CavemanSkillPath: NativeCavemanSkillPath(h, NativeSkillClaude),
 			SteSkillDir:      NativeSteSkillDir(h, NativeSkillClaude),
 		},
 		{
 			ID: "cursor", DisplayName: "Cursor", Binary: "cursor",
-			ConfigDir: filepath.Join(h, ".cursor"),
-			MCP: jsonMcp(filepath.Join(h, ".cursor", "mcp.json"), "mcpServers", StdioServerConfig(true)),
+			ConfigDir:       filepath.Join(h, ".cursor"),
+			MCP:             jsonMcp(filepath.Join(h, ".cursor", "mcp.json"), "mcpServers", StdioServerConfig(true)),
 			CursorRulesPath: filepath.Join(h, ".cursor", "rules", "miru-code.mdc"),
-			HooksPath: filepath.Join(h, ".cursor", "hooks.json"), HooksFormat: "cursor",
+			HooksPath:       filepath.Join(h, ".cursor", "hooks.json"), HooksFormat: "cursor",
 			SubagentPath: filepath.Join(h, ".cursor", "agents", "miru-code.md"), SubagentID: "cursor",
 			CavemanSkillPath: sharedCaveman,
 			SteSkillDir:      sharedSte,
 		},
 		{
 			ID: "gemini", DisplayName: "Gemini CLI", Binary: "gemini",
-			ConfigDir: filepath.Join(h, ".gemini"),
-			MCP: jsonMcp(filepath.Join(h, ".gemini", "settings.json"), "mcpServers", StdioServerConfig(true)),
+			ConfigDir:        filepath.Join(h, ".gemini"),
+			MCP:              jsonMcp(filepath.Join(h, ".gemini", "settings.json"), "mcpServers", StdioServerConfig(true)),
 			InstructionsPath: filepath.Join(h, ".gemini", "GEMINI.md"),
-			HooksPath: filepath.Join(h, ".gemini", "settings.json"), HooksFormat: "gemini",
+			HooksPath:        filepath.Join(h, ".gemini", "settings.json"), HooksFormat: "gemini",
 			SubagentPath: filepath.Join(h, ".gemini", "agents", "miru-code.md"), SubagentID: "gemini",
 			CavemanSkillPath: sharedCaveman,
 			SteSkillDir:      sharedSte,
 		},
 		{
 			ID: "kiro", DisplayName: "Kiro", Binary: "kiro",
-			ConfigDir: filepath.Join(h, ".kiro"),
-			MCP: jsonMcp(filepath.Join(h, ".kiro", "settings", "mcp.json"), "mcpServers", StdioServerConfig(true)),
+			ConfigDir:        filepath.Join(h, ".kiro"),
+			MCP:              jsonMcp(filepath.Join(h, ".kiro", "settings", "mcp.json"), "mcpServers", StdioServerConfig(true)),
 			InstructionsPath: filepath.Join(h, ".kiro", "steering", "miru.md"),
-			HooksPath: filepath.Join(h, ".kiro", "settings", "hooks.json"), HooksFormat: "kiro",
+			HooksPath:        filepath.Join(h, ".kiro", "settings", "hooks.json"), HooksFormat: "kiro",
 			SubagentPath: filepath.Join(h, ".kiro", "agents", "miru-code.md"), SubagentID: "kiro",
 			CavemanSkillPath: NativeCavemanSkillPath(h, NativeSkillKiro),
 			SteSkillDir:      NativeSteSkillDir(h, NativeSkillKiro),
 		},
 		{
 			ID: "opencode", DisplayName: "OpenCode", Binary: "opencode",
-			ConfigDir: opencodeDir,
-			MCP: jsonMcp(opencodeMcpPath(), "mcp", OpenCodeServerConfig()),
+			ConfigDir:        opencodeDir,
+			MCP:              jsonMcp(opencodeMcpPath(), "mcp", OpenCodeServerConfig()),
 			InstructionsPath: filepath.Join(opencodeDir, "AGENTS.md"),
 			HooksPath:        opencodePluginPath(h),
 			HooksFormat:      "opencode",
@@ -303,8 +309,8 @@ func AgentTargets() []AgentTarget {
 		},
 		{
 			ID: "copilot", DisplayName: "GitHub Copilot",
-			ConfigDir: filepath.Join(h, ".config", "github-copilot"),
-			MCP: jsonMcp(filepath.Join(CopilotHomeDir(h), "mcp-config.json"), "mcpServers", StdioServerConfig(false)),
+			ConfigDir:    filepath.Join(h, ".config", "github-copilot"),
+			MCP:          jsonMcp(filepath.Join(CopilotHomeDir(h), "mcp-config.json"), "mcpServers", StdioServerConfig(false)),
 			HooksPath:    copilotHooksPath(h),
 			HooksFormat:  "vscode",
 			SubagentPath: filepath.Join(CopilotHomeDir(h), "agents", "miru-code.agent.md"), SubagentID: "copilot",
@@ -313,8 +319,8 @@ func AgentTargets() []AgentTarget {
 		},
 		{
 			ID: "codex", DisplayName: "Codex", Binary: "codex",
-			ConfigDir: filepath.Join(h, ".codex"),
-			MCP: &McpConfig{Path: filepath.Join(h, ".codex", "config.toml"), Key: "mcp_servers", MemberKey: "miru", Entry: map[string]any{}, Format: FormatTOML},
+			ConfigDir:        filepath.Join(h, ".codex"),
+			MCP:              &McpConfig{Path: filepath.Join(h, ".codex", "config.toml"), Key: "mcp_servers", MemberKey: "miru", Entry: map[string]any{}, Format: FormatTOML},
 			InstructionsPath: filepath.Join(h, ".codex", "AGENTS.md"),
 			HooksPath:        filepath.Join(h, ".codex", "hooks.json"), HooksFormat: "claude",
 			CavemanSkillPath: sharedCaveman,
@@ -322,7 +328,7 @@ func AgentTargets() []AgentTarget {
 		},
 		{
 			ID: "vscode", DisplayName: "VS Code", Binary: "code",
-			MCP: jsonMcp(vscodeMcpPath(), "servers", StdioServerConfig(true)),
+			MCP:              jsonMcp(vscodeMcpPath(), "servers", StdioServerConfig(true)),
 			HooksPath:        copilotHooksPath(h),
 			HooksFormat:      "vscode",
 			CavemanSkillPath: sharedCaveman,
@@ -330,7 +336,7 @@ func AgentTargets() []AgentTarget {
 		},
 		{
 			ID: "windsurf", DisplayName: "Windsurf / Devin Desktop", Binary: "windsurf",
-			ConfigDir: filepath.Join(h, ".codeium", "windsurf"),
+			ConfigDir:        filepath.Join(h, ".codeium", "windsurf"),
 			HooksPath:        filepath.Join(h, ".codeium", "windsurf", "hooks.json"),
 			HooksFormat:      "windsurf",
 			CavemanSkillPath: sharedCaveman,
@@ -338,7 +344,7 @@ func AgentTargets() []AgentTarget {
 		},
 		{
 			ID: "visualstudio", DisplayName: "Visual Studio",
-			MCP: jsonMcp(visualStudioMcpPath(), "servers", StdioServerConfig(true)),
+			MCP:              jsonMcp(visualStudioMcpPath(), "servers", StdioServerConfig(true)),
 			HooksPath:        copilotHooksPath(h),
 			HooksFormat:      "vscode",
 			CavemanSkillPath: sharedCaveman,

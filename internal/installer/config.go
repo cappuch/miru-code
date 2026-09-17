@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/tailscale/hujson"
 )
 
 // StripJSONComments removes // and /* */ comments outside strings.
@@ -64,7 +66,11 @@ func parseJSONObject(text string) (map[string]any, bool) {
 		return map[string]any{}, true
 	}
 	var parsed any
-	if err := json.Unmarshal([]byte(StripJSONComments(trimmed)), &parsed); err != nil {
+	standard, err := hujson.Standardize([]byte(trimmed))
+	if err != nil {
+		return nil, false
+	}
+	if err := json.Unmarshal(standard, &parsed); err != nil {
 		return nil, false
 	}
 	m, ok := parsed.(map[string]any)
@@ -119,77 +125,12 @@ func withRemovedMember(root map[string]any, sectionKey, memberKey string) map[st
 
 // MergeJSONMember upserts section.memberKey = value in a JSON config file.
 func MergeJSONMember(path, sectionKey, memberKey string, value map[string]any) (InstallAction, error) {
-	existed := false
-	text := ""
-	if data, err := os.ReadFile(path); err == nil {
-		existed = true
-		text = string(data)
-	}
-	parsed, ok := parseJSONObject(text)
-	if !ok {
-		return ActionError, nil
-	}
-	section, _ := parsed[sectionKey].(map[string]any)
-	if section == nil {
-		section = map[string]any{}
-	}
-	if existing, ok := section[memberKey].(map[string]any); ok {
-		a, _ := json.Marshal(existing)
-		b, _ := json.Marshal(value)
-		if string(a) == string(b) {
-			return ActionUnchanged, nil
-		}
-	}
-	next := withMergedMember(parsed, sectionKey, memberKey, value)
-	data, err := json.MarshalIndent(next, "", "  ")
-	if err != nil {
-		return ActionError, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return ActionError, err
-	}
-	if err := os.WriteFile(path, []byte(ensureTrailingNewline(string(data))), 0o644); err != nil {
-		return ActionError, err
-	}
-	if existed {
-		return ActionUpdated, nil
-	}
-	return ActionCreated, nil
+	return editJSONMember(path, sectionKey, memberKey, value, false)
 }
 
 // RemoveJSONMember removes section.memberKey from a JSON config file.
 func RemoveJSONMember(path, sectionKey, memberKey string) (InstallAction, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return ActionNotFound, nil
-		}
-		return ActionError, err
-	}
-	parsed, ok := parseJSONObject(string(data))
-	if !ok {
-		return ActionError, nil
-	}
-	section, _ := parsed[sectionKey].(map[string]any)
-	if section == nil {
-		return ActionNotFound, nil
-	}
-	if _, ok := section[memberKey]; !ok {
-		return ActionNotFound, nil
-	}
-	next := withRemovedMember(parsed, sectionKey, memberKey)
-	if len(next) == 0 {
-		_ = os.Remove(path)
-		return ActionRemoved, nil
-	}
-	out, err := json.MarshalIndent(next, "", "  ")
-	if err != nil {
-		return ActionError, err
-	}
-	if err := os.WriteFile(path, []byte(ensureTrailingNewline(string(out))), 0o644); err != nil {
-		return ActionError, err
-	}
-	return ActionRemoved, nil
+	return editJSONMember(path, sectionKey, memberKey, nil, true)
 }
 
 // ReplaceOrAppendMarked writes/updates a <!-- miru:start --> block.
