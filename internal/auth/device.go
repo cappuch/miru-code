@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -130,14 +131,27 @@ func parseTokenError(payload oauthTokenError) string {
 }
 
 func postForm(client *http.Client, endpoint string, body url.Values) (*http.Response, error) {
+	return postFormContext(context.Background(), client, endpoint, body)
+}
+
+func postFormContext(ctx context.Context, client *http.Client, endpoint string, body url.Values) (*http.Response, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return client.Post(endpoint, "application/x-www-form-urlencoded", strings.NewReader(body.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return client.Do(req)
 }
 
 // StartDeviceAuthorization begins the device-code flow.
 func StartDeviceAuthorization(config *DeviceAuthConfig, client *http.Client) (DeviceAuthorizationStart, error) {
+	return StartDeviceAuthorizationContext(context.Background(), config, client)
+}
+
+func StartDeviceAuthorizationContext(ctx context.Context, config *DeviceAuthConfig, client *http.Client) (DeviceAuthorizationStart, error) {
 	cfg := ResolveDeviceAuthConfig()
 	if config != nil {
 		cfg = *config
@@ -149,12 +163,15 @@ func StartDeviceAuthorization(config *DeviceAuthConfig, client *http.Client) (De
 	if cfg.Audience != "" {
 		body.Set("audience", cfg.Audience)
 	}
-	resp, err := postForm(client, resolveURL(cfg.BaseURL, cfg.DeviceCodePath), body)
+	resp, err := postFormContext(ctx, client, resolveURL(cfg.BaseURL, cfg.DeviceCodePath), body)
 	if err != nil {
 		return DeviceAuthorizationStart{}, err
 	}
 	defer resp.Body.Close()
-	text, _ := io.ReadAll(resp.Body)
+	text, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return DeviceAuthorizationStart{}, err
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg := string(text)
 		if msg == "" {
@@ -207,6 +224,10 @@ type DeviceAuthorizationCheck struct {
 
 // CheckDeviceAuthorizationOnce polls the token endpoint once (no sleep).
 func CheckDeviceAuthorizationOnce(start DeviceAuthorizationStart, config *DeviceAuthConfig, client *http.Client) (DeviceAuthorizationCheck, error) {
+	return CheckDeviceAuthorizationOnceContext(context.Background(), start, config, client)
+}
+
+func CheckDeviceAuthorizationOnceContext(ctx context.Context, start DeviceAuthorizationStart, config *DeviceAuthConfig, client *http.Client) (DeviceAuthorizationCheck, error) {
 	cfg := ResolveDeviceAuthConfig()
 	if config != nil {
 		cfg = *config
@@ -216,12 +237,15 @@ func CheckDeviceAuthorizationOnce(start DeviceAuthorizationStart, config *Device
 		"device_code": {start.DeviceCode},
 		"client_id":   {cfg.ClientID},
 	}
-	resp, err := postForm(client, resolveURL(cfg.BaseURL, cfg.TokenPath), body)
+	resp, err := postFormContext(ctx, client, resolveURL(cfg.BaseURL, cfg.TokenPath), body)
 	if err != nil {
 		return DeviceAuthorizationCheck{}, err
 	}
 	defer resp.Body.Close()
-	text, _ := io.ReadAll(resp.Body)
+	text, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return DeviceAuthorizationCheck{}, err
+	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		var success oauthTokenSuccess
 		if len(text) > 0 {
@@ -252,14 +276,26 @@ func CheckDeviceAuthorizationOnce(start DeviceAuthorizationStart, config *Device
 
 // PollDeviceAuthorization blocks until approval, denial, expiry, or timeout.
 func PollDeviceAuthorization(start DeviceAuthorizationStart, config *DeviceAuthConfig, client *http.Client) (DeviceAuthorizationTokens, error) {
+	return PollDeviceAuthorizationContext(context.Background(), start, config, client)
+}
+
+func PollDeviceAuthorizationContext(ctx context.Context, start DeviceAuthorizationStart, config *DeviceAuthConfig, client *http.Client) (DeviceAuthorizationTokens, error) {
 	deadline := time.Now().Add(time.Duration(start.ExpiresIn) * time.Second)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	interval := time.Duration(start.Interval) * time.Second
 	if interval < 0 {
 		interval = 5 * time.Second
 	}
 	for time.Now().Before(deadline) {
-		time.Sleep(interval)
-		check, err := CheckDeviceAuthorizationOnce(start, config, client)
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return DeviceAuthorizationTokens{}, ctx.Err()
+		case <-timer.C:
+		}
+		check, err := CheckDeviceAuthorizationOnceContext(ctx, start, config, client)
 		if err != nil {
 			return DeviceAuthorizationTokens{}, err
 		}
